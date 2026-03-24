@@ -111,6 +111,7 @@ def detection_loop(rtsp_url, labels, confidence, every_n, save_on_start):
         nonlocal writer, csv_file, csv_writer
         vpath = f"{OUTPUT_DIR}/detection_{ts}.mp4"
         cpath = f"{OUTPUT_DIR}/counts_{ts}.csv"
+
         ffmpeg_cmd = [
             'ffmpeg', '-y',
             '-f', 'rawvideo',
@@ -138,20 +139,19 @@ def detection_loop(rtsp_url, labels, confidence, every_n, save_on_start):
             session["save_path"] = vpath
         print(f"Saving video : {vpath}")
         print(f"Saving CSV   : {cpath}")
-
-    def close_writers():
-        nonlocal writer, csv_file, csv_writer
-    if writer:
-        writer.stdin.close()
-        writer.wait()
-        writer = None
-    if csv_file:
-        csv_file.close()
-        csv_file = None
-    csv_writer = None
-    with session_lock:
-        session["save_path"] = None
-    print("Stopped saving")
+        def close_writers():
+            nonlocal writer, csv_file, csv_writer
+        if writer:
+            writer.stdin.close()
+            writer.wait()
+            writer = None
+        if csv_file:
+            csv_file.close()
+            csv_file = None
+        csv_writer = None
+        with session_lock:
+            session["save_path"] = None
+        print("Stopped saving")
 
     if save_on_start:
         open_writers(datetime.now().strftime("%Y%m%d_%H%M%S"))
@@ -377,24 +377,33 @@ def list_recordings():
     return JSONResponse(files)
 
 
-@app.get("/recordings/{filename}")
+@app.api_route("/recordings/{filename}", methods=["GET", "HEAD"])
 def stream_recording(filename: str, request: Request):
     filename = os.path.basename(filename)
     fpath    = os.path.join(OUTPUT_DIR, filename)
     if not os.path.exists(fpath):
         raise HTTPException(status_code=404, detail="File not found")
 
-    file_size = os.path.getsize(fpath)
+    file_size    = os.path.getsize(fpath)
     range_header = request.headers.get("range")
 
+    if request.method == "HEAD":
+        return Response(
+            status_code=200,
+            media_type="video/mp4",
+            headers={
+                "Accept-Ranges":  "bytes",
+                "Content-Length": str(file_size),
+            }
+        )
+
     if range_header:
-        # Parse "bytes=start-end"
-        range_val   = range_header.strip().lower().replace("bytes=", "")
-        parts       = range_val.split("-")
-        start       = int(parts[0]) if parts[0] else 0
-        end         = int(parts[1]) if parts[1] else file_size - 1
-        end         = min(end, file_size - 1)
-        chunk_size  = end - start + 1
+        range_val  = range_header.strip().lower().replace("bytes=", "")
+        parts      = range_val.split("-")
+        start      = int(parts[0]) if parts[0] else 0
+        end        = int(parts[1]) if parts[1] else file_size - 1
+        end        = min(end, file_size - 1)
+        chunk_size = end - start + 1
 
         with open(fpath, "rb") as f:
             f.seek(start)
@@ -411,7 +420,6 @@ def stream_recording(filename: str, request: Request):
             }
         )
     else:
-        # Full file request
         with open(fpath, "rb") as f:
             data = f.read()
         return Response(
