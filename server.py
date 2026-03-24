@@ -108,26 +108,50 @@ def detection_loop(rtsp_url, labels, confidence, every_n, save_on_start):
     csv_writer = None
 
     def open_writers(ts):
-        nonlocal writer, csv_file, csv_writer
-        vpath = f"{OUTPUT_DIR}/detection_{ts}.mp4"
-        cpath = f"{OUTPUT_DIR}/counts_{ts}.csv"
-        writer     = cv2.VideoWriter(vpath, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
-        csv_file   = open(cpath, "w", newline="")
-        csv_writer = csv.writer(csv_file)
-        csv_writer.writerow(["frame","timestamp"] + labels + ["total_tracks","fps"])
-        with session_lock:
-            session["save_path"] = vpath
-        print(f"Saving video : {vpath}")
-        print(f"Saving CSV   : {cpath}")
+    nonlocal writer, csv_file, csv_writer
+    vpath = f"{OUTPUT_DIR}/detection_{ts}.mp4"
+    cpath = f"{OUTPUT_DIR}/counts_{ts}.csv"
+
+    # Write via ffmpeg pipe — produces H.264 which browsers can play natively
+    ffmpeg_cmd = [
+        'ffmpeg', '-y',
+        '-f', 'rawvideo',
+        '-vcodec', 'rawvideo',
+        '-pix_fmt', 'bgr24',
+        '-s', f'{width}x{height}',
+        '-r', str(fps),
+        '-i', '-',
+        '-vcodec', 'libx264',
+        '-preset', 'fast',
+        '-crf', '23',
+        '-pix_fmt', 'yuv420p',   # required for browser compatibility
+        '-movflags', 'frag_keyframe+empty_moov',  # allows streaming/seeking
+        vpath
+    ]
+    writer = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL)
+
+    csv_file   = open(cpath, "w", newline="")
+    csv_writer = csv.writer(csv_file)
+    csv_writer.writerow(["frame","timestamp"] + labels + ["total_tracks","fps"])
+    with session_lock:
+        session["save_path"] = vpath
+    print(f"Saving video : {vpath}")
+    print(f"Saving CSV   : {cpath}")
 
     def close_writers():
-        nonlocal writer, csv_file, csv_writer
-        if writer:   writer.release();   writer = None
-        if csv_file: csv_file.close();   csv_file = None
-        csv_writer = None
-        with session_lock:
-            session["save_path"] = None
-        print("Stopped saving")
+    nonlocal writer, csv_file, csv_writer
+    if writer:
+        writer.stdin.close()
+        writer.wait()
+        writer = None
+    if csv_file:
+        csv_file.close()
+        csv_file = None
+    csv_writer = None
+    with session_lock:
+        session["save_path"] = None
+    print("Stopped saving")
 
     if save_on_start:
         open_writers(datetime.now().strftime("%Y%m%d_%H%M%S"))
@@ -235,8 +259,11 @@ def detection_loop(rtsp_url, labels, confidence, every_n, save_on_start):
                 session["frame_idx"] = frame_idx
 
             # ── Write to disk if saving ──────────────────────────────────────
-            if writer:
-                writer.write(annotated)
+            if writer and writer.stdin:
+                try:
+                    writer.stdin.write(annotated.tobytes())
+                except BrokenPipeError:
+                    pass
             if csv_writer:
                 row = [frame_idx, round(elapsed,2)]
                 row += [counts.get(l,0) for l in labels]
