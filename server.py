@@ -5,8 +5,6 @@ from PIL import Image as PILImage
 from collections import defaultdict
 from datetime import datetime
 import torch
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from typing import List
@@ -30,16 +28,16 @@ session = {
     "labels":       [],
     "rtsp_url":     None,
     "started_at":   None,
-    "saving":       False,   # whether we are currently saving to disk
-    "save_path":    None,    # current video save path
+    "saving":       False,
+    "save_path":    None,
 }
 session_lock   = threading.Lock()
 session_thread = None
 
 # ── Global writer state ───────────────────────────────────────────────────────
-writer     = None
-csv_file   = None
-csv_writer = None
+writer      = None
+csv_file    = None
+csv_writer  = None
 writer_lock = threading.Lock()
 
 app = FastAPI()
@@ -50,72 +48,88 @@ class StartRequest(BaseModel):
     labels:     List[str]
     confidence: float = 0.30
     every_n:    int   = 5
-    save:       bool  = False   # start saving immediately
+    save:       bool  = False
 
 class SaveRequest(BaseModel):
-    save: bool   # True = start saving, False = stop saving
-# ── Writer functions (global scope) ──────────────────────────────────────────
+    save: bool
+
+
+# ── Writer functions ──────────────────────────────────────────────────────────
 def open_writers(ts, labels_list, width, height, fps):
+    """Open ffmpeg video writer and CSV writer. Must NOT be called while holding session_lock."""
     global writer, csv_file, csv_writer
-    
+
+    vpath = f"{OUTPUT_DIR}/detection_{ts}.mp4"
+    cpath = f"{OUTPUT_DIR}/counts_{ts}.csv"
+
+    ffmpeg_cmd = [
+        'ffmpeg', '-y',
+        '-f', 'rawvideo',
+        '-vcodec', 'rawvideo',
+        '-pix_fmt', 'bgr24',
+        '-s', f'{width}x{height}',
+        '-r', str(int(fps)),
+        '-i', 'pipe:0',
+        '-codec:v', 'libx264',
+        '-preset', 'ultrafast',
+        '-crf', '23',
+        '-pix_fmt', 'yuv420p',
+        vpath
+    ]
+
     with writer_lock:
-        vpath = f"{OUTPUT_DIR}/detection_{ts}.mp4"
-        cpath = f"{OUTPUT_DIR}/counts_{ts}.csv"
-
-        ffmpeg_cmd = [
-            'ffmpeg', '-y',
-            '-f', 'rawvideo',
-            '-vcodec', 'rawvideo',
-            '-pix_fmt', 'bgr24',
-            '-s', f'{width}x{height}',
-            '-r', str(int(fps)),
-            '-i', 'pipe:0',
-            '-codec:v', 'libx264',
-            '-preset', 'ultrafast',
-            '-crf', '23',
-            '-pix_fmt', 'yuv420p',
-            vpath
-        ]
-
-        writer = subprocess.Popen(
+        new_writer = subprocess.Popen(
             ffmpeg_cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE
         )
+        print(f"[DEBUG] ffmpeg started PID={new_writer.pid}")
 
-        print(f"[DEBUG] ffmpeg started PID={writer.pid}")
+        new_csv_file = open(cpath, "w", newline="")
+        new_csv_writer = csv.writer(new_csv_file)
+        new_csv_writer.writerow(["frame", "timestamp"] + labels_list + ["total_tracks", "fps"])
 
-        csv_file = open(cpath, "w", newline="")
-        csv_writer = csv.writer(csv_file)
-        csv_writer.writerow(["frame", "timestamp"] + labels_list + ["total_tracks", "fps"])
-        
-        with session_lock:
-            session["save_path"] = vpath
-        
-        print(f"Saving video : {vpath}")
-        print(f"Saving CSV   : {cpath}")
+        writer     = new_writer
+        csv_file   = new_csv_file
+        csv_writer = new_csv_writer
+
+    # Update session separately to avoid lock-ordering issues
+    with session_lock:
+        session["save_path"] = vpath
+
+    print(f"Saving video : {vpath}")
+    print(f"Saving CSV   : {cpath}")
 
 
 def close_writers():
+    """Close ffmpeg and CSV writers safely."""
     global writer, csv_file, csv_writer
-    
+
     with writer_lock:
-        if writer:
-            writer.stdin.close()
-            writer.wait()
+        if writer is not None:
+            try:
+                writer.stdin.close()
+                writer.wait()
+            except Exception as e:
+                print(f"[DEBUG] ffmpeg close error: {e}")
             writer = None
 
-        if csv_file:
-            csv_file.close()
+        if csv_file is not None:
+            try:
+                csv_file.close()
+            except Exception as e:
+                print(f"[DEBUG] CSV close error: {e}")
             csv_file = None
 
         csv_writer = None
-        
-        with session_lock:
-            session["save_path"] = None
-        
-        print("[DEBUG] writers closed")
+
+    with session_lock:
+        session["save_path"] = None
+
+    print("[DEBUG] writers closed")
+
+
 # ── Cleanup old output files (30 min) ────────────────────────────────────────
 def cleanup_loop():
     while True:
@@ -133,10 +147,9 @@ def cleanup_loop():
             print(f"Cleanup error: {e}")
         time.sleep(300)
 
+
 # ── Detection loop ────────────────────────────────────────────────────────────
 def detection_loop(rtsp_url, labels, confidence, every_n, save_on_start):
-    global writer, csv_file, csv_writer
-    
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     # Load SAM3
@@ -173,11 +186,16 @@ def detection_loop(rtsp_url, labels, confidence, every_n, save_on_start):
 
     if save_on_start:
         open_writers(datetime.now().strftime("%Y%m%d_%H%M%S"), labels, width, height, fps)
-    t_frame      = time.time()
+        # Sync the session saving flag so the write block activates
+        with session_lock:
+            session["saving"] = True
+
+    # FIX 1: initialise frame counter and wall-clock start BEFORE the loop
+    frame_idx    = 0
+    t_start      = time.time()
+    t_frame      = t_start
     fps_display  = 0.0
     last_sv_dets = sv.Detections.empty()
-    palette      = [(0,200,100),(255,165,0),(100,149,237),(200,50,200),
-                    (0,200,200),(200,200,0),(255,80,80),(80,255,80)]
 
     with session_lock:
         session["running"]    = True
@@ -195,10 +213,14 @@ def detection_loop(rtsp_url, labels, confidence, every_n, save_on_start):
                 print("Stop signal received")
                 break
 
+            # FIX 2: read writer under writer_lock to avoid race condition
+            with writer_lock:
+                writer_active = writer is not None
+
             # Toggle saving on/off at runtime
-            if should_save and writer is None:
+            if should_save and not writer_active:
                 open_writers(datetime.now().strftime("%Y%m%d_%H%M%S"), labels, width, height, fps)
-            elif not should_save and writer is not None:
+            elif not should_save and writer_active:
                 close_writers()
 
             # ── Read frame ───────────────────────────────────────────────────
@@ -251,7 +273,7 @@ def detection_loop(rtsp_url, labels, confidence, every_n, save_on_start):
                 counts[name] += 1
                 label_texts.append(f"#{tid} {name} {conf:.2f}")
 
-            # ── Annotate (no panel overlay — stats shown in UI) ──────────────
+            # ── Annotate ─────────────────────────────────────────────────────
             annotated = frame.copy()
             annotated = trace_ann.annotate(annotated, tracked)
             annotated = box_ann.annotate(annotated, tracked)
@@ -262,7 +284,7 @@ def detection_loop(rtsp_url, labels, confidence, every_n, save_on_start):
             now         = time.time()
             fps_display = 1.0 / max(now - t_frame, 1e-6)
             t_frame     = now
-            elapsed     = now - t_start
+            elapsed     = now - t_start   # FIX 3: t_start is now defined
 
             # ── Push to browser ──────────────────────────────────────────────
             with session_lock:
@@ -275,29 +297,37 @@ def detection_loop(rtsp_url, labels, confidence, every_n, save_on_start):
             with session_lock:
                 currently_saving = session["saving"]
 
-            if currently_saving and writer is not None:
+            # FIX 4: read writer safely under lock for the write block
+            with writer_lock:
+                current_writer = writer
+
+            if currently_saving and current_writer is not None:
                 try:
-                    writer.stdin.write(annotated.tobytes())
-                    writer.stdin.flush()
+                    current_writer.stdin.write(annotated.tobytes())
+                    current_writer.stdin.flush()
                 except BrokenPipeError:
-                    print("[ffmpeg] Broken pipe")
-                    writer = None
+                    print("[ffmpeg] Broken pipe — stopping save")
+                    with writer_lock:
+                        writer = None
                     with session_lock:
                         session["saving"] = False
 
-            elif currently_saving and writer is None:
-                print(f"[DEBUG] saving=True but writer None frame={frame_idx}")
-            
-            if csv_writer:
-                row = [frame_idx, round(elapsed,2)]
-                row += [counts.get(l,0) for l in labels]
-                row += [len(tracked), round(fps_display,2)]
-                csv_writer.writerow(row)
+            elif currently_saving and current_writer is None:
+                print(f"[DEBUG] saving=True but writer is None at frame={frame_idx}")
+
+            # ── CSV row ──────────────────────────────────────────────────────
+            with writer_lock:
+                cw = csv_writer
+            if cw is not None:
+                row = [frame_idx, round(elapsed, 2)]
+                row += [counts.get(l, 0) for l in labels]
+                row += [len(tracked), round(fps_display, 2)]
+                cw.writerow(row)
 
             if frame_idx % 30 == 0:
                 print(f"Frame {frame_idx:05d} | {fps_display:.1f}fps | {dict(counts)}")
 
-            frame_idx += 1
+            frame_idx += 1   # FIX 5: increment the local variable (was shadowing nothing before fix 1)
 
     except Exception as e:
         with session_lock:
@@ -310,6 +340,7 @@ def detection_loop(rtsp_url, labels, confidence, every_n, save_on_start):
             session["running"] = False
             session["saving"]  = False
         print("Detection loop stopped")
+
 
 # ── API endpoints ─────────────────────────────────────────────────────────────
 @app.post("/session/start")
@@ -456,6 +487,7 @@ def stream_recording(filename: str, request: Request):
             }
         )
 
+
 @app.get("/video")
 def video_feed():
     def generate():
@@ -463,9 +495,9 @@ def video_feed():
             with session_lock:
                 frame = session["frame"]
             if frame is None:
-                blank = np.zeros((360,640,3), dtype=np.uint8)
-                cv2.putText(blank, "Waiting for stream...", (140,180),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (60,60,60), 2)
+                blank = np.zeros((360, 640, 3), dtype=np.uint8)
+                cv2.putText(blank, "Waiting for stream...", (140, 180),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (60, 60, 60), 2)
                 frame = blank
             _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
             yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + buf.tobytes() + b"\r\n"
