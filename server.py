@@ -135,6 +135,8 @@ def cleanup_loop():
 
 # ── Detection loop ────────────────────────────────────────────────────────────
 def detection_loop(rtsp_url, labels, confidence, every_n, save_on_start):
+    global writer, csv_file, csv_writer
+    
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     # Load SAM3
