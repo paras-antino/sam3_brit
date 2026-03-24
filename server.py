@@ -120,7 +120,7 @@ def detection_loop(rtsp_url, labels, confidence, every_n, save_on_start):
             '-s', f'{width}x{height}',
             '-r', str(int(fps)),
             '-i', 'pipe:0',
-            '-vcodec', 'libx264',
+            '-codec:v', 'libx264',
             '-preset', 'ultrafast',
             '-crf', '23',
             '-pix_fmt', 'yuv420p',
@@ -130,8 +130,13 @@ def detection_loop(rtsp_url, labels, confidence, every_n, save_on_start):
             ffmpeg_cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
+            stderr=subprocess.PIPE
         )
+        def log_ffmpeg_err(proc):
+            for line in proc.stderr:
+                print(f"[ffmpeg] {line.decode().strip()}")
+        threading.Thread(target=log_ffmpeg_err, args=(writer,), daemon=True).start()
+
         csv_file   = open(cpath, "w", newline="")
         csv_writer = csv.writer(csv_file)
         csv_writer.writerow(["frame","timestamp"] + labels + ["total_tracks","fps"])
