@@ -1,0 +1,553 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>SAM3 Detection</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: #0a0a0a;
+    color: #e0e0e0;
+    font-family: 'Courier New', monospace;
+    min-height: 100vh;
+  }
+
+  header {
+    background: #111;
+    border-bottom: 1px solid #1e1e1e;
+    padding: 16px 32px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  header h1 { color: #00c864; font-size: 1.1rem; letter-spacing: 3px; }
+  header span { color: #333; font-size: 0.75rem; }
+
+  .container {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 32px 24px;
+    display: grid;
+    grid-template-columns: 360px 1fr;
+    gap: 24px;
+    align-items: start;
+  }
+
+  /* ── Left panel ── */
+  .panel {
+    background: #111;
+    border: 1px solid #1e1e1e;
+    border-radius: 8px;
+    padding: 24px;
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+  }
+
+  .panel h2 {
+    font-size: 0.7rem;
+    letter-spacing: 2px;
+    color: #444;
+    text-transform: uppercase;
+    padding-bottom: 12px;
+    border-bottom: 1px solid #1a1a1a;
+  }
+
+  label {
+    display: block;
+    font-size: 0.7rem;
+    color: #666;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    margin-bottom: 6px;
+  }
+
+  input[type="text"], input[type="range"] {
+    width: 100%;
+    background: #0d0d0d;
+    border: 1px solid #2a2a2a;
+    border-radius: 4px;
+    color: #e0e0e0;
+    font-family: inherit;
+    font-size: 0.85rem;
+    padding: 10px 12px;
+    outline: none;
+    transition: border-color 0.2s;
+  }
+  input[type="text"]:focus { border-color: #00c864; }
+
+  /* Tags input area */
+  .tags-wrapper {
+    background: #0d0d0d;
+    border: 1px solid #2a2a2a;
+    border-radius: 4px;
+    padding: 8px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    min-height: 48px;
+    cursor: text;
+    transition: border-color 0.2s;
+  }
+  .tags-wrapper:focus-within { border-color: #00c864; }
+
+  .tag {
+    background: #1a2a1a;
+    border: 1px solid #00c864;
+    color: #00c864;
+    border-radius: 3px;
+    padding: 3px 8px;
+    font-size: 0.75rem;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    white-space: nowrap;
+  }
+  .tag button {
+    background: none;
+    border: none;
+    color: #00c864;
+    cursor: pointer;
+    padding: 0;
+    font-size: 0.85rem;
+    line-height: 1;
+    opacity: 0.6;
+  }
+  .tag button:hover { opacity: 1; }
+
+  #tag-input {
+    background: none;
+    border: none;
+    outline: none;
+    color: #e0e0e0;
+    font-family: inherit;
+    font-size: 0.85rem;
+    padding: 3px 4px;
+    flex: 1;
+    min-width: 80px;
+  }
+
+  .hint { font-size: 0.68rem; color: #333; margin-top: 4px; }
+
+  /* Slider */
+  .slider-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 6px;
+  }
+  .slider-val { color: #00c864; font-size: 0.85rem; }
+
+  input[type="range"] {
+    padding: 0;
+    height: 4px;
+    accent-color: #00c864;
+    cursor: pointer;
+  }
+
+  /* Buttons */
+  .btn {
+    width: 100%;
+    padding: 12px;
+    border: none;
+    border-radius: 4px;
+    font-family: inherit;
+    font-size: 0.85rem;
+    font-weight: bold;
+    letter-spacing: 1px;
+    cursor: pointer;
+    transition: opacity 0.2s, transform 0.1s;
+  }
+  .btn:active { transform: scale(0.98); }
+  .btn-start  { background: #00c864; color: #000; }
+  .btn-stop   { background: #e05555; color: #fff; display: none; }
+  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  /* Status pill */
+  .status-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.72rem;
+    padding: 4px 10px;
+    border-radius: 20px;
+    background: #1a1a1a;
+    border: 1px solid #2a2a2a;
+    color: #555;
+  }
+  .status-pill.running { border-color: #00c864; color: #00c864; background: #0a1a0a; }
+  .status-pill.error   { border-color: #e05555; color: #e05555; background: #1a0a0a; }
+  .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+  .dot.pulse { animation: pulse 1.2s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+
+  #error-msg {
+    font-size: 0.75rem;
+    color: #e05555;
+    background: #1a0a0a;
+    border: 1px solid #3a1a1a;
+    border-radius: 4px;
+    padding: 8px 12px;
+    display: none;
+  }
+
+  /* ── Right panel ── */
+  .video-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+
+  .video-wrapper {
+    background: #0d0d0d;
+    border: 1px solid #1e1e1e;
+    border-radius: 8px;
+    overflow: hidden;
+    aspect-ratio: 16/9;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: relative;
+  }
+
+  #video-feed {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    display: none;
+  }
+
+  .video-placeholder {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 12px;
+    color: #2a2a2a;
+  }
+  .video-placeholder svg { width: 48px; height: 48px; }
+  .video-placeholder p { font-size: 0.8rem; }
+
+  /* Stats cards */
+  #stats-grid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+  }
+
+  .stat-card {
+    background: #111;
+    border: 1px solid #1e1e1e;
+    border-radius: 6px;
+    padding: 12px 18px;
+    min-width: 100px;
+    text-align: center;
+    flex: 1;
+  }
+  .stat-card .slbl { font-size: 0.62rem; color: #444; text-transform: uppercase; letter-spacing: 1px; }
+  .stat-card .sval { font-size: 1.4rem; font-weight: bold; margin-top: 4px; color: #00c864; }
+  .stat-card.fps .sval   { color: #cc44cc; }
+  .stat-card.frames .sval { color: #888; }
+
+  @media (max-width: 900px) {
+    .container { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>⬡ SAM3 LIVE DETECTION</h1>
+  <span>RTX 5060 Ti · SAM3 + ByteTrack</span>
+</header>
+
+<div class="container">
+
+  <!-- ── Left config panel ── -->
+  <div class="panel">
+    <h2>Session Config</h2>
+
+    <!-- Status -->
+    <div>
+      <div class="status-pill" id="status-pill">
+        <span class="dot" id="status-dot"></span>
+        <span id="status-text">Idle</span>
+      </div>
+    </div>
+
+    <!-- RTSP URL -->
+    <div>
+      <label>RTSP Stream URL</label>
+      <input type="text" id="rtsp-url" placeholder="rtsp://192.168.1.100:554/stream"/>
+    </div>
+
+    <!-- Labels / tags -->
+    <div>
+      <label>Detection Targets</label>
+      <div class="tags-wrapper" id="tags-wrapper" onclick="document.getElementById('tag-input').focus()">
+        <input id="tag-input" type="text" placeholder="Type label, press Enter"/>
+      </div>
+      <p class="hint">Examples: person · car · dog · backpack · laptop</p>
+    </div>
+
+    <!-- Confidence -->
+    <div>
+      <div class="slider-row">
+        <label style="margin:0">Confidence Threshold</label>
+        <span class="slider-val" id="conf-val">0.30</span>
+      </div>
+      <input type="range" id="confidence" min="0.10" max="0.90" step="0.05" value="0.30"
+             oninput="document.getElementById('conf-val').textContent=parseFloat(this.value).toFixed(2)"/>
+    </div>
+
+    <!-- Error -->
+    <div id="error-msg"></div>
+
+    <!-- Buttons -->
+    <button class="btn btn-start" id="btn-start" onclick="startSession()">▶ START SESSION</button>
+    <button class="btn btn-stop"  id="btn-stop"  onclick="stopSession()">■ STOP SESSION</button>
+  </div>
+
+  <!-- ── Right video panel ── -->
+  <div class="video-panel">
+    <div class="video-wrapper">
+      <div class="video-placeholder" id="video-placeholder">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1">
+          <rect x="2" y="7" width="15" height="10" rx="1"/>
+          <path d="M17 9l5-3v12l-5-3"/>
+        </svg>
+        <p>Configure and start a session to view the stream</p>
+      </div>
+      <img id="video-feed" src="" alt="live feed"/>
+    </div>
+
+    <!-- Stats -->
+    <div id="stats-grid">
+      <div class="stat-card fps">
+        <div class="slbl">FPS</div>
+        <div class="sval" id="s-fps">—</div>
+      </div>
+      <div class="stat-card frames">
+        <div class="slbl">Frames</div>
+        <div class="sval" id="s-frames">—</div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+  // ── Tag input logic ──────────────────────────────────────────────────────
+  let tags = [];
+
+  const tagInput   = document.getElementById('tag-input');
+  const tagsWrapper = document.getElementById('tags-wrapper');
+
+  tagInput.addEventListener('keydown', e => {
+    if ((e.key === 'Enter' || e.key === ',') && tagInput.value.trim()) {
+      e.preventDefault();
+      addTag(tagInput.value.trim().toLowerCase());
+      tagInput.value = '';
+    }
+    if (e.key === 'Backspace' && tagInput.value === '' && tags.length) {
+      removeTag(tags[tags.length - 1]);
+    }
+  });
+
+  function addTag(val) {
+    if (!val || tags.includes(val)) return;
+    tags.push(val);
+    renderTags();
+  }
+
+  function removeTag(val) {
+    tags = tags.filter(t => t !== val);
+    renderTags();
+  }
+
+  function renderTags() {
+    // Remove existing tag elements (keep the input)
+    tagsWrapper.querySelectorAll('.tag').forEach(el => el.remove());
+    tags.forEach(t => {
+      const el = document.createElement('div');
+      el.className = 'tag';
+      el.innerHTML = `${t}<button onclick="removeTag('${t}')" title="Remove">×</button>`;
+      tagsWrapper.insertBefore(el, tagInput);
+    });
+  }
+
+  // ── Session control ──────────────────────────────────────────────────────
+  async function startSession() {
+    const rtsp = document.getElementById('rtsp-url').value.trim();
+    const conf = parseFloat(document.getElementById('confidence').value);
+
+    if (!rtsp) { showError('Please enter an RTSP URL.'); return; }
+    if (tags.length === 0) { showError('Add at least one detection target.'); return; }
+
+    hideError();
+    setUIState('starting');
+
+    try {
+      const res = await fetch('/session/start', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ rtsp_url: rtsp, labels: tags, confidence: conf, every_n: 5 })
+      });
+      const data = await res.json();
+
+      if (!res.ok) {
+        showError(data.detail || 'Failed to start session.');
+        setUIState('idle');
+        return;
+      }
+
+      setUIState('running');
+      startPolling();
+      showVideo();
+
+    } catch(e) {
+      showError('Could not reach server.');
+      setUIState('idle');
+    }
+  }
+
+  async function stopSession() {
+    setUIState('stopping');
+    try {
+      await fetch('/session/stop', { method: 'POST' });
+    } catch(e) {}
+    setUIState('idle');
+    stopPolling();
+    hideVideo();
+    resetStats();
+  }
+
+  // ── Polling /session/status ──────────────────────────────────────────────
+  let pollTimer = null;
+
+  function startPolling() {
+    pollTimer = setInterval(async () => {
+      try {
+        const d = await (await fetch('/session/status')).json();
+
+        // Update FPS + frames
+        document.getElementById('s-fps').textContent    = d.fps.toFixed(1);
+        document.getElementById('s-frames').textContent = d.frame_idx;
+
+        // Dynamic count cards
+        updateCountCards(d.counts, d.labels || tags);
+
+        // Error from backend
+        if (d.error) { showError(d.error); }
+
+        // Detect unexpected stop
+        if (!d.running && document.getElementById('btn-stop').style.display !== 'none') {
+          setUIState('idle');
+          stopPolling();
+          hideVideo();
+        }
+      } catch(e) {}
+    }, 1500);
+  }
+
+  function stopPolling() {
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  }
+
+  // ── Dynamic count cards ──────────────────────────────────────────────────
+  const palette = ['#00c864','#ffa500','#6495ed','#cc44cc','#00c8c8','#c8c800','#ff5050','#50ff50'];
+
+  function updateCountCards(counts, labelList) {
+    const grid = document.getElementById('stats-grid');
+
+    // Remove old label cards (keep fps + frames which are first two)
+    grid.querySelectorAll('.label-card').forEach(el => el.remove());
+
+    labelList.forEach((lbl, i) => {
+      const card = document.createElement('div');
+      card.className = 'stat-card label-card';
+      card.style.borderColor = palette[i % palette.length] + '55';
+      card.innerHTML = `
+        <div class="slbl">${lbl}</div>
+        <div class="sval" style="color:${palette[i % palette.length]}">${counts[lbl] ?? 0}</div>`;
+      grid.appendChild(card);
+    });
+  }
+
+  // ── UI helpers ───────────────────────────────────────────────────────────
+  function setUIState(state) {
+    const pill  = document.getElementById('status-pill');
+    const dot   = document.getElementById('status-dot');
+    const txt   = document.getElementById('status-text');
+    const start = document.getElementById('btn-start');
+    const stop  = document.getElementById('btn-stop');
+
+    pill.className = 'status-pill';
+    dot.className  = 'dot';
+
+    if (state === 'running') {
+      pill.classList.add('running');
+      dot.classList.add('pulse');
+      txt.textContent    = 'Running';
+      start.style.display = 'none';
+      stop.style.display  = 'block';
+    } else if (state === 'starting' || state === 'stopping') {
+      txt.textContent     = state === 'starting' ? 'Starting...' : 'Stopping...';
+      start.disabled      = true;
+      stop.disabled       = true;
+    } else {
+      txt.textContent     = 'Idle';
+      start.style.display = 'block';
+      start.disabled      = false;
+      stop.style.display  = 'none';
+      stop.disabled       = false;
+    }
+  }
+
+  function showVideo() {
+    const feed = document.getElementById('video-feed');
+    feed.src = '/video?' + Date.now();
+    feed.style.display = 'block';
+    document.getElementById('video-placeholder').style.display = 'none';
+  }
+
+  function hideVideo() {
+    const feed = document.getElementById('video-feed');
+    feed.style.display = 'none';
+    feed.src = '';
+    document.getElementById('video-placeholder').style.display = 'flex';
+  }
+
+  function resetStats() {
+    document.getElementById('s-fps').textContent    = '—';
+    document.getElementById('s-frames').textContent = '—';
+    document.getElementById('stats-grid').querySelectorAll('.label-card').forEach(el => el.remove());
+  }
+
+  function showError(msg) {
+    const el = document.getElementById('error-msg');
+    el.textContent    = '⚠ ' + msg;
+    el.style.display  = 'block';
+  }
+
+  function hideError() {
+    document.getElementById('error-msg').style.display = 'none';
+  }
+
+  // ── Check if session already running on page load ────────────────────────
+  (async () => {
+    try {
+      const d = await (await fetch('/session/status')).json();
+      if (d.running) {
+        document.getElementById('rtsp-url').value = d.rtsp_url || '';
+        d.labels?.forEach(addTag);
+        setUIState('running');
+        startPolling();
+        showVideo();
+      }
+    } catch(e) {}
+  })();
+</script>
+</body>
+</html>
