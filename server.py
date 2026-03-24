@@ -109,35 +109,35 @@ def detection_loop(rtsp_url, labels, confidence, every_n, save_on_start):
 
     def open_writers(ts):
         nonlocal writer, csv_file, csv_writer
-    vpath = f"{OUTPUT_DIR}/detection_{ts}.mp4"
-    cpath = f"{OUTPUT_DIR}/counts_{ts}.csv"
-
-    # Write via ffmpeg pipe — produces H.264 which browsers can play natively
-    ffmpeg_cmd = [
-        'ffmpeg', '-y',
-        '-f', 'rawvideo',
-        '-vcodec', 'rawvideo',
-        '-pix_fmt', 'bgr24',
-        '-s', f'{width}x{height}',
-        '-r', str(fps),
-        '-i', '-',
-        '-vcodec', 'libx264',
-        '-preset', 'fast',
-        '-crf', '23',
-        '-pix_fmt', 'yuv420p',   # required for browser compatibility
-        '-movflags', 'frag_keyframe+empty_moov',  # allows streaming/seeking
-        vpath
-    ]
-    writer = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE,
-                              stderr=subprocess.DEVNULL)
-
-    csv_file   = open(cpath, "w", newline="")
-    csv_writer = csv.writer(csv_file)
-    csv_writer.writerow(["frame","timestamp"] + labels + ["total_tracks","fps"])
-    with session_lock:
-        session["save_path"] = vpath
-    print(f"Saving video : {vpath}")
-    print(f"Saving CSV   : {cpath}")
+        vpath = f"{OUTPUT_DIR}/detection_{ts}.mp4"
+        cpath = f"{OUTPUT_DIR}/counts_{ts}.csv"
+        ffmpeg_cmd = [
+            'ffmpeg', '-y',
+            '-f', 'rawvideo',
+            '-vcodec', 'rawvideo',
+            '-pix_fmt', 'bgr24',
+            '-s', f'{width}x{height}',
+            '-r', str(int(fps)),
+            '-i', 'pipe:0',
+            '-vcodec', 'libx264',
+            '-preset', 'ultrafast',
+            '-crf', '23',
+            '-pix_fmt', 'yuv420p',
+            vpath
+        ]
+        writer = subprocess.Popen(
+            ffmpeg_cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        csv_file   = open(cpath, "w", newline="")
+        csv_writer = csv.writer(csv_file)
+        csv_writer.writerow(["frame","timestamp"] + labels + ["total_tracks","fps"])
+        with session_lock:
+            session["save_path"] = vpath
+        print(f"Saving video : {vpath}")
+        print(f"Saving CSV   : {cpath}")
 
     def close_writers():
         nonlocal writer, csv_file, csv_writer
