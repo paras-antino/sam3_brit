@@ -1,4 +1,6 @@
 import cv2, csv, time, threading, numpy as np, os, psutil, subprocess
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse, Response
 from PIL import Image as PILImage
 from collections import defaultdict
 from datetime import datetime
@@ -349,21 +351,51 @@ def list_recordings():
 
 
 @app.get("/recordings/{filename}")
-def stream_recording(filename: str):
-    # Prevent path traversal
+def stream_recording(filename: str, request: Request):
     filename = os.path.basename(filename)
     fpath    = os.path.join(OUTPUT_DIR, filename)
     if not os.path.exists(fpath):
         raise HTTPException(status_code=404, detail="File not found")
 
-    def iter_file():
+    file_size = os.path.getsize(fpath)
+    range_header = request.headers.get("range")
+
+    if range_header:
+        # Parse "bytes=start-end"
+        range_val   = range_header.strip().lower().replace("bytes=", "")
+        parts       = range_val.split("-")
+        start       = int(parts[0]) if parts[0] else 0
+        end         = int(parts[1]) if parts[1] else file_size - 1
+        end         = min(end, file_size - 1)
+        chunk_size  = end - start + 1
+
         with open(fpath, "rb") as f:
-            while chunk := f.read(1024 * 256):
-                yield chunk
+            f.seek(start)
+            data = f.read(chunk_size)
 
-    return StreamingResponse(iter_file(), media_type="video/mp4",
-                             headers={"Content-Disposition": f"inline; filename={filename}"})
-
+        return Response(
+            content=data,
+            status_code=206,
+            media_type="video/mp4",
+            headers={
+                "Content-Range":  f"bytes {start}-{end}/{file_size}",
+                "Accept-Ranges":  "bytes",
+                "Content-Length": str(chunk_size),
+            }
+        )
+    else:
+        # Full file request
+        with open(fpath, "rb") as f:
+            data = f.read()
+        return Response(
+            content=data,
+            status_code=200,
+            media_type="video/mp4",
+            headers={
+                "Accept-Ranges":  "bytes",
+                "Content-Length": str(file_size),
+            }
+        )
 
 @app.get("/video")
 def video_feed():
