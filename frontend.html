@@ -6,252 +6,201 @@
 <title>SAM3 Detection</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
-
-  body {
-    background: #0a0a0a;
-    color: #e0e0e0;
-    font-family: 'Courier New', monospace;
-    min-height: 100vh;
-  }
+  body { background: #0a0a0a; color: #e0e0e0; font-family: 'Courier New', monospace; min-height: 100vh; }
 
   header {
-    background: #111;
-    border-bottom: 1px solid #1e1e1e;
-    padding: 16px 32px;
-    display: flex;
-    align-items: center;
-    gap: 12px;
+    background: #111; border-bottom: 1px solid #1e1e1e;
+    padding: 14px 32px; display: flex; align-items: center; justify-content: space-between;
   }
   header h1 { color: #00c864; font-size: 1.1rem; letter-spacing: 3px; }
-  header span { color: #333; font-size: 0.75rem; }
+  header span { color: #333; font-size: 0.72rem; }
 
-  .container {
-    max-width: 1200px;
-    margin: 0 auto;
-    padding: 32px 24px;
+  /* Tabs */
+  .tabs {
+    display: flex; gap: 0;
+    border-bottom: 1px solid #1e1e1e;
+    background: #0d0d0d;
+    padding: 0 24px;
+  }
+  .tab {
+    padding: 12px 24px; font-size: 0.72rem; letter-spacing: 1px;
+    text-transform: uppercase; cursor: pointer; color: #444;
+    border-bottom: 2px solid transparent; transition: all 0.2s;
+    background: none; border-top: none; border-left: none; border-right: none;
+    font-family: inherit;
+  }
+  .tab:hover { color: #888; }
+  .tab.active { color: #00c864; border-bottom-color: #00c864; }
+
+  /* Pages */
+  .page { display: none; }
+  .page.active { display: block; }
+
+  /* ── Live page layout ── */
+  .layout {
+    max-width: 1400px; margin: 0 auto; padding: 24px;
     display: grid;
-    grid-template-columns: 360px 1fr;
-    gap: 24px;
-    align-items: start;
+    grid-template-columns: 300px 1fr 220px;
+    gap: 20px; align-items: start;
   }
 
-  /* ── Left panel ── */
   .panel {
-    background: #111;
-    border: 1px solid #1e1e1e;
-    border-radius: 8px;
-    padding: 24px;
-    display: flex;
-    flex-direction: column;
-    gap: 20px;
+    background: #111; border: 1px solid #1e1e1e;
+    border-radius: 8px; padding: 20px;
+    display: flex; flex-direction: column; gap: 16px;
   }
-
-  .panel h2 {
-    font-size: 0.7rem;
-    letter-spacing: 2px;
-    color: #444;
-    text-transform: uppercase;
-    padding-bottom: 12px;
+  .panel-title {
+    font-size: 0.65rem; letter-spacing: 2px; color: #444;
+    text-transform: uppercase; padding-bottom: 12px;
     border-bottom: 1px solid #1a1a1a;
   }
 
-  label {
-    display: block;
-    font-size: 0.7rem;
-    color: #666;
-    text-transform: uppercase;
-    letter-spacing: 1px;
-    margin-bottom: 6px;
-  }
-
-  input[type="text"], input[type="range"] {
-    width: 100%;
-    background: #0d0d0d;
-    border: 1px solid #2a2a2a;
-    border-radius: 4px;
-    color: #e0e0e0;
-    font-family: inherit;
-    font-size: 0.85rem;
-    padding: 10px 12px;
-    outline: none;
-    transition: border-color 0.2s;
+  label { display: block; font-size: 0.68rem; color: #555; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 5px; }
+  input[type="text"] {
+    width: 100%; background: #0d0d0d; border: 1px solid #2a2a2a;
+    border-radius: 4px; color: #e0e0e0; font-family: inherit;
+    font-size: 0.82rem; padding: 9px 11px; outline: none; transition: border-color 0.2s;
   }
   input[type="text"]:focus { border-color: #00c864; }
 
-  /* Tags input area */
   .tags-wrapper {
-    background: #0d0d0d;
-    border: 1px solid #2a2a2a;
-    border-radius: 4px;
-    padding: 8px;
-    display: flex;
-    flex-wrap: wrap;
-    gap: 6px;
-    min-height: 48px;
-    cursor: text;
-    transition: border-color 0.2s;
+    background: #0d0d0d; border: 1px solid #2a2a2a; border-radius: 4px;
+    padding: 7px; display: flex; flex-wrap: wrap; gap: 5px;
+    min-height: 44px; cursor: text; transition: border-color 0.2s;
   }
   .tags-wrapper:focus-within { border-color: #00c864; }
-
   .tag {
-    background: #1a2a1a;
-    border: 1px solid #00c864;
-    color: #00c864;
-    border-radius: 3px;
-    padding: 3px 8px;
-    font-size: 0.75rem;
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    white-space: nowrap;
+    background: #0a1a0a; border: 1px solid #00c864; color: #00c864;
+    border-radius: 3px; padding: 2px 7px; font-size: 0.72rem;
+    display: flex; align-items: center; gap: 5px;
   }
-  .tag button {
-    background: none;
-    border: none;
-    color: #00c864;
-    cursor: pointer;
-    padding: 0;
-    font-size: 0.85rem;
-    line-height: 1;
-    opacity: 0.6;
-  }
+  .tag button { background: none; border: none; color: #00c864; cursor: pointer; padding: 0; font-size: 0.8rem; opacity: 0.6; }
   .tag button:hover { opacity: 1; }
-
   #tag-input {
-    background: none;
-    border: none;
-    outline: none;
-    color: #e0e0e0;
-    font-family: inherit;
-    font-size: 0.85rem;
-    padding: 3px 4px;
-    flex: 1;
-    min-width: 80px;
+    background: none; border: none; outline: none; color: #e0e0e0;
+    font-family: inherit; font-size: 0.82rem; padding: 2px 4px; flex: 1; min-width: 80px;
   }
+  .hint { font-size: 0.65rem; color: #2a2a2a; margin-top: 3px; }
 
-  .hint { font-size: 0.68rem; color: #333; margin-top: 4px; }
+  .slider-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px; }
+  .slider-val { color: #00c864; font-size: 0.82rem; }
+  input[type="range"] { width: 100%; height: 4px; accent-color: #00c864; cursor: pointer; }
 
-  /* Slider */
-  .slider-row {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin-bottom: 6px;
-  }
-  .slider-val { color: #00c864; font-size: 0.85rem; }
-
-  input[type="range"] {
-    padding: 0;
-    height: 4px;
-    accent-color: #00c864;
-    cursor: pointer;
-  }
-
-  /* Buttons */
   .btn {
-    width: 100%;
-    padding: 12px;
-    border: none;
-    border-radius: 4px;
-    font-family: inherit;
-    font-size: 0.85rem;
-    font-weight: bold;
-    letter-spacing: 1px;
-    cursor: pointer;
-    transition: opacity 0.2s, transform 0.1s;
+    width: 100%; padding: 11px; border: none; border-radius: 4px;
+    font-family: inherit; font-size: 0.82rem; font-weight: bold;
+    letter-spacing: 1px; cursor: pointer; transition: opacity 0.2s, transform 0.1s;
   }
   .btn:active { transform: scale(0.98); }
   .btn-start  { background: #00c864; color: #000; }
   .btn-stop   { background: #e05555; color: #fff; display: none; }
+  .btn-save   { background: #1a1a2a; border: 1px solid #6495ed; color: #6495ed; display: none; }
+  .btn-save.saving { background: #0a0a1a; border-color: #e05555; color: #e05555; }
   .btn:disabled { opacity: 0.4; cursor: not-allowed; }
 
-  /* Status pill */
   .status-pill {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    font-size: 0.72rem;
-    padding: 4px 10px;
-    border-radius: 20px;
-    background: #1a1a1a;
-    border: 1px solid #2a2a2a;
-    color: #555;
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 0.7rem; padding: 4px 10px; border-radius: 20px;
+    background: #1a1a1a; border: 1px solid #2a2a2a; color: #555;
   }
   .status-pill.running { border-color: #00c864; color: #00c864; background: #0a1a0a; }
-  .status-pill.error   { border-color: #e05555; color: #e05555; background: #1a0a0a; }
   .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
   .dot.pulse { animation: pulse 1.2s infinite; }
   @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
 
   #error-msg {
-    font-size: 0.75rem;
-    color: #e05555;
-    background: #1a0a0a;
-    border: 1px solid #3a1a1a;
-    border-radius: 4px;
-    padding: 8px 12px;
-    display: none;
+    font-size: 0.72rem; color: #e05555; background: #1a0a0a;
+    border: 1px solid #3a1a1a; border-radius: 4px; padding: 8px 10px; display: none;
   }
 
-  /* ── Right panel ── */
-  .video-panel {
-    display: flex;
-    flex-direction: column;
-    gap: 16px;
+  /* Save indicator */
+  .save-indicator {
+    display: none; align-items: center; gap: 6px;
+    font-size: 0.68rem; color: #e05555;
   }
+  .save-indicator.active { display: flex; }
+  .rec-dot { width: 8px; height: 8px; border-radius: 50%; background: #e05555; animation: pulse 1s infinite; }
 
+  /* Middle */
+  .middle { display: flex; flex-direction: column; gap: 14px; }
   .video-wrapper {
-    background: #0d0d0d;
-    border: 1px solid #1e1e1e;
-    border-radius: 8px;
-    overflow: hidden;
-    aspect-ratio: 16/9;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    position: relative;
+    background: #0d0d0d; border: 1px solid #1e1e1e; border-radius: 8px;
+    overflow: hidden; aspect-ratio: 16/9;
+    display: flex; align-items: center; justify-content: center; position: relative;
   }
+  #video-feed { width: 100%; height: 100%; object-fit: contain; display: none; }
+  .video-placeholder { display: flex; flex-direction: column; align-items: center; gap: 10px; color: #222; }
+  .video-placeholder svg { width: 44px; height: 44px; }
+  .video-placeholder p { font-size: 0.75rem; }
 
-  #video-feed {
-    width: 100%;
-    height: 100%;
-    object-fit: contain;
-    display: none;
+  .stream-meta { display: flex; gap: 10px; flex-wrap: wrap; }
+  .meta-chip {
+    background: #111; border: 1px solid #1e1e1e; border-radius: 6px;
+    padding: 7px 14px; font-size: 0.72rem; color: #444;
+    display: flex; gap: 6px; align-items: center;
   }
+  .meta-chip span { color: #e0e0e0; font-size: 0.88rem; }
 
-  .video-placeholder {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 12px;
-    color: #2a2a2a;
+  .counts-row { display: flex; flex-wrap: wrap; gap: 10px; }
+  .count-card {
+    background: #111; border: 1px solid #1e1e1e; border-radius: 6px;
+    padding: 10px 16px; flex: 1; min-width: 90px; text-align: center;
   }
-  .video-placeholder svg { width: 48px; height: 48px; }
-  .video-placeholder p { font-size: 0.8rem; }
+  .count-card .clbl { font-size: 0.6rem; color: #444; text-transform: uppercase; letter-spacing: 1px; }
+  .count-card .cval { font-size: 1.6rem; font-weight: bold; margin-top: 3px; }
 
-  /* Stats cards */
-  #stats-grid {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 12px;
+  /* Resource panel */
+  .res-item { display: flex; flex-direction: column; gap: 6px; }
+  .res-header { display: flex; justify-content: space-between; align-items: center; }
+  .res-label { font-size: 0.65rem; color: #444; text-transform: uppercase; letter-spacing: 1px; }
+  .res-value { font-size: 0.8rem; font-weight: bold; }
+  .bar-track { height: 5px; background: #1a1a1a; border-radius: 3px; overflow: hidden; }
+  .bar-fill { height: 100%; border-radius: 3px; transition: width 0.6s ease; width: 0%; }
+  .bar-cpu  { background: #cc44cc; }
+  .bar-ram  { background: #ffa500; }
+  .bar-gpu  { background: #00c864; }
+  .bar-vram { background: #6495ed; }
+  .res-sub { font-size: 0.62rem; color: #333; }
+
+  /* ── Recordings page ── */
+  .recordings-layout {
+    max-width: 1100px; margin: 0 auto; padding: 24px;
+    display: grid; grid-template-columns: 1fr 1.6fr; gap: 20px; align-items: start;
   }
-
-  .stat-card {
-    background: #111;
-    border: 1px solid #1e1e1e;
-    border-radius: 6px;
-    padding: 12px 18px;
-    min-width: 100px;
-    text-align: center;
-    flex: 1;
+  .rec-list { display: flex; flex-direction: column; gap: 8px; }
+  .rec-item {
+    background: #111; border: 1px solid #1e1e1e; border-radius: 6px;
+    padding: 12px 16px; cursor: pointer; transition: border-color 0.2s;
+    display: flex; flex-direction: column; gap: 4px;
   }
-  .stat-card .slbl { font-size: 0.62rem; color: #444; text-transform: uppercase; letter-spacing: 1px; }
-  .stat-card .sval { font-size: 1.4rem; font-weight: bold; margin-top: 4px; color: #00c864; }
-  .stat-card.fps .sval   { color: #cc44cc; }
-  .stat-card.frames .sval { color: #888; }
+  .rec-item:hover { border-color: #333; }
+  .rec-item.selected { border-color: #00c864; }
+  .rec-name { font-size: 0.8rem; color: #e0e0e0; }
+  .rec-meta { font-size: 0.65rem; color: #444; display: flex; gap: 12px; }
+  .rec-empty { font-size: 0.78rem; color: #333; padding: 20px 0; }
 
-  @media (max-width: 900px) {
-    .container { grid-template-columns: 1fr; }
+  .video-player-wrap {
+    background: #0d0d0d; border: 1px solid #1e1e1e; border-radius: 8px;
+    overflow: hidden; aspect-ratio: 16/9;
+    display: flex; align-items: center; justify-content: center; position: sticky; top: 24px;
+  }
+  #rec-player { width: 100%; height: 100%; display: none; }
+  .player-placeholder { color: #222; font-size: 0.78rem; }
+
+  .refresh-btn {
+    background: #111; border: 1px solid #2a2a2a; color: #555;
+    padding: 7px 14px; border-radius: 4px; font-family: inherit;
+    font-size: 0.72rem; cursor: pointer; transition: color 0.2s;
+  }
+  .refresh-btn:hover { color: #e0e0e0; }
+
+  @media (max-width: 1100px) {
+    .layout { grid-template-columns: 300px 1fr; }
+    .resource-panel { display: none; }
+  }
+  @media (max-width: 750px) {
+    .layout { grid-template-columns: 1fr; }
+    .recordings-layout { grid-template-columns: 1fr; }
   }
 </style>
 </head>
@@ -262,13 +211,20 @@
   <span>RTX 5060 Ti · SAM3 + ByteTrack</span>
 </header>
 
-<div class="container">
+<!-- Tabs -->
+<div class="tabs">
+  <button class="tab active" onclick="switchTab('live', this)">Live Stream</button>
+  <button class="tab" onclick="switchTab('recordings', this)">Recordings</button>
+</div>
 
-  <!-- ── Left config panel ── -->
+<!-- ══════════ LIVE PAGE ══════════ -->
+<div id="page-live" class="page active">
+<div class="layout">
+
+  <!-- Left config -->
   <div class="panel">
-    <h2>Session Config</h2>
+    <div class="panel-title">Session Config</div>
 
-    <!-- Status -->
     <div>
       <div class="status-pill" id="status-pill">
         <span class="dot" id="status-dot"></span>
@@ -276,41 +232,43 @@
       </div>
     </div>
 
-    <!-- RTSP URL -->
     <div>
       <label>RTSP Stream URL</label>
-      <input type="text" id="rtsp-url" placeholder="rtsp://192.168.1.100:554/stream"/>
+      <input type="text" id="rtsp-url" placeholder="rtsp://192.168.1.x:554/stream"/>
     </div>
 
-    <!-- Labels / tags -->
     <div>
       <label>Detection Targets</label>
       <div class="tags-wrapper" id="tags-wrapper" onclick="document.getElementById('tag-input').focus()">
         <input id="tag-input" type="text" placeholder="Type label, press Enter"/>
       </div>
-      <p class="hint">Examples: person · car · dog · backpack · laptop</p>
+      <p class="hint">e.g. person · car · laptop · dog</p>
     </div>
 
-    <!-- Confidence -->
     <div>
       <div class="slider-row">
-        <label style="margin:0">Confidence Threshold</label>
+        <label style="margin:0">Confidence</label>
         <span class="slider-val" id="conf-val">0.30</span>
       </div>
       <input type="range" id="confidence" min="0.10" max="0.90" step="0.05" value="0.30"
              oninput="document.getElementById('conf-val').textContent=parseFloat(this.value).toFixed(2)"/>
     </div>
 
-    <!-- Error -->
     <div id="error-msg"></div>
 
-    <!-- Buttons -->
     <button class="btn btn-start" id="btn-start" onclick="startSession()">▶ START SESSION</button>
     <button class="btn btn-stop"  id="btn-stop"  onclick="stopSession()">■ STOP SESSION</button>
+    <button class="btn btn-save"  id="btn-save"  onclick="toggleSave()">⏺ START RECORDING</button>
+
+    <!-- Recording indicator -->
+    <div class="save-indicator" id="save-indicator">
+      <div class="rec-dot"></div>
+      <span>Recording to disk...</span>
+    </div>
   </div>
 
-  <!-- ── Right video panel ── -->
-  <div class="video-panel">
+  <!-- Middle video + stats -->
+  <div class="middle">
     <div class="video-wrapper">
       <div class="video-placeholder" id="video-placeholder">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1">
@@ -322,26 +280,92 @@
       <img id="video-feed" src="" alt="live feed"/>
     </div>
 
-    <!-- Stats -->
-    <div id="stats-grid">
-      <div class="stat-card fps">
-        <div class="slbl">FPS</div>
-        <div class="sval" id="s-fps">—</div>
+    <div class="stream-meta">
+      <div class="meta-chip">FPS &nbsp;<span id="s-fps">—</span></div>
+      <div class="meta-chip">Frames &nbsp;<span id="s-frames">—</span></div>
+      <div class="meta-chip">Tracked &nbsp;<span id="s-tracked">—</span></div>
+    </div>
+
+    <div class="counts-row" id="counts-row"></div>
+  </div>
+
+  <!-- Right resource monitor -->
+  <div class="panel resource-panel">
+    <div class="panel-title">Resources</div>
+
+    <div class="res-item">
+      <div class="res-header">
+        <span class="res-label">CPU</span>
+        <span class="res-value" id="r-cpu">—</span>
       </div>
-      <div class="stat-card frames">
-        <div class="slbl">Frames</div>
-        <div class="sval" id="s-frames">—</div>
+      <div class="bar-track"><div class="bar-fill bar-cpu" id="b-cpu"></div></div>
+    </div>
+
+    <div class="res-item">
+      <div class="res-header">
+        <span class="res-label">RAM</span>
+        <span class="res-value" id="r-ram">—</span>
       </div>
+      <div class="bar-track"><div class="bar-fill bar-ram" id="b-ram"></div></div>
+      <div class="res-sub" id="r-ram-sub"></div>
+    </div>
+
+    <div class="res-item">
+      <div class="res-header">
+        <span class="res-label">GPU</span>
+        <span class="res-value" id="r-gpu">—</span>
+      </div>
+      <div class="bar-track"><div class="bar-fill bar-gpu" id="b-gpu"></div></div>
+    </div>
+
+    <div class="res-item">
+      <div class="res-header">
+        <span class="res-label">VRAM</span>
+        <span class="res-value" id="r-vram">—</span>
+      </div>
+      <div class="bar-track"><div class="bar-fill bar-vram" id="b-vram"></div></div>
+      <div class="res-sub" id="r-vram-sub"></div>
     </div>
   </div>
 
 </div>
+</div>
+
+<!-- ══════════ RECORDINGS PAGE ══════════ -->
+<div id="page-recordings" class="page">
+<div class="recordings-layout">
+
+  <div>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
+      <span style="font-size:0.65rem;letter-spacing:2px;color:#444;text-transform:uppercase">Saved Recordings</span>
+      <button class="refresh-btn" onclick="loadRecordings()">↻ Refresh</button>
+    </div>
+    <div class="rec-list" id="rec-list">
+      <div class="rec-empty">No recordings found.</div>
+    </div>
+  </div>
+
+  <div class="video-player-wrap">
+    <video id="rec-player" controls></video>
+    <div class="player-placeholder" id="player-placeholder">Select a recording to play</div>
+  </div>
+
+</div>
+</div>
 
 <script>
-  // ── Tag input logic ──────────────────────────────────────────────────────
-  let tags = [];
+  // ── Tab switching ──────────────────────────────────────────────────────────
+  function switchTab(name, el) {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+    el.classList.add('active');
+    document.getElementById('page-' + name).classList.add('active');
+    if (name === 'recordings') loadRecordings();
+  }
 
-  const tagInput   = document.getElementById('tag-input');
+  // ── Tags ───────────────────────────────────────────────────────────────────
+  let tags = [];
+  const tagInput    = document.getElementById('tag-input');
   const tagsWrapper = document.getElementById('tags-wrapper');
 
   tagInput.addEventListener('keydown', e => {
@@ -360,14 +384,11 @@
     tags.push(val);
     renderTags();
   }
-
   function removeTag(val) {
     tags = tags.filter(t => t !== val);
     renderTags();
   }
-
   function renderTags() {
-    // Remove existing tag elements (keep the input)
     tagsWrapper.querySelectorAll('.tag').forEach(el => el.remove());
     tags.forEach(t => {
       const el = document.createElement('div');
@@ -377,35 +398,25 @@
     });
   }
 
-  // ── Session control ──────────────────────────────────────────────────────
+  // ── Session ────────────────────────────────────────────────────────────────
   async function startSession() {
     const rtsp = document.getElementById('rtsp-url').value.trim();
     const conf = parseFloat(document.getElementById('confidence').value);
-
-    if (!rtsp) { showError('Please enter an RTSP URL.'); return; }
-    if (tags.length === 0) { showError('Add at least one detection target.'); return; }
-
+    if (!rtsp)        { showError('Please enter an RTSP URL.'); return; }
+    if (!tags.length) { showError('Add at least one detection target.'); return; }
     hideError();
     setUIState('starting');
-
     try {
-      const res = await fetch('/session/start', {
+      const res  = await fetch('/session/start', {
         method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({ rtsp_url: rtsp, labels: tags, confidence: conf, every_n: 5 })
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({rtsp_url:rtsp, labels:tags, confidence:conf, every_n:5, save:false})
       });
       const data = await res.json();
-
-      if (!res.ok) {
-        showError(data.detail || 'Failed to start session.');
-        setUIState('idle');
-        return;
-      }
-
+      if (!res.ok) { showError(data.detail || 'Failed to start.'); setUIState('idle'); return; }
       setUIState('running');
       startPolling();
       showVideo();
-
     } catch(e) {
       showError('Could not reach server.');
       setUIState('idle');
@@ -414,128 +425,198 @@
 
   async function stopSession() {
     setUIState('stopping');
-    try {
-      await fetch('/session/stop', { method: 'POST' });
-    } catch(e) {}
-    setUIState('idle');
-    stopPolling();
-    hideVideo();
-    resetStats();
+    try { await fetch('/session/stop', {method:'POST'}); } catch(e) {}
+    setTimeout(() => {
+      setUIState('idle');
+      stopPolling();
+      hideVideo();
+      resetStats();
+      setSaveUI(false);
+    }, 3500);
   }
 
-  // ── Polling /session/status ──────────────────────────────────────────────
+  let isSaving = false;
+  async function toggleSave() {
+    isSaving = !isSaving;
+    try {
+      await fetch('/session/save', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({save: isSaving})
+      });
+    } catch(e) {}
+    setSaveUI(isSaving);
+  }
+
+  function setSaveUI(saving) {
+    isSaving = saving;
+    const btn = document.getElementById('btn-save');
+    const ind = document.getElementById('save-indicator');
+    if (saving) {
+      btn.textContent = '⏹ STOP RECORDING';
+      btn.classList.add('saving');
+      ind.classList.add('active');
+    } else {
+      btn.textContent = '⏺ START RECORDING';
+      btn.classList.remove('saving');
+      ind.classList.remove('active');
+    }
+  }
+
+  // ── Polling ────────────────────────────────────────────────────────────────
   let pollTimer = null;
+  const palette = ['#00c864','#ffa500','#6495ed','#cc44cc','#00c8c8','#c8c800','#ff5050','#50ff50'];
 
   function startPolling() {
     pollTimer = setInterval(async () => {
       try {
         const d = await (await fetch('/session/status')).json();
-
-        // Update FPS + frames
-        document.getElementById('s-fps').textContent    = d.fps.toFixed(1);
-        document.getElementById('s-frames').textContent = d.frame_idx;
-
-        // Dynamic count cards
+        document.getElementById('s-fps').textContent     = d.fps.toFixed(1);
+        document.getElementById('s-frames').textContent  = d.frame_idx;
+        document.getElementById('s-tracked').textContent = Object.values(d.counts).reduce((a,b)=>a+b,0);
         updateCountCards(d.counts, d.labels || tags);
-
-        // Error from backend
-        if (d.error) { showError(d.error); }
-
-        // Detect unexpected stop
+        if (d.saving !== isSaving) setSaveUI(d.saving);
+        if (d.error) showError(d.error);
         if (!d.running && document.getElementById('btn-stop').style.display !== 'none') {
-          setUIState('idle');
-          stopPolling();
-          hideVideo();
+          setUIState('idle'); stopPolling(); stopResourcePolling(); hideVideo(); setSaveUI(false);
         }
       } catch(e) {}
     }, 1500);
   }
-
   function stopPolling() {
     if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
   }
 
-  // ── Dynamic count cards ──────────────────────────────────────────────────
-  const palette = ['#00c864','#ffa500','#6495ed','#cc44cc','#00c8c8','#c8c800','#ff5050','#50ff50'];
-
   function updateCountCards(counts, labelList) {
-    const grid = document.getElementById('stats-grid');
-
-    // Remove old label cards (keep fps + frames which are first two)
-    grid.querySelectorAll('.label-card').forEach(el => el.remove());
-
+    const row = document.getElementById('counts-row');
+    row.innerHTML = '';
     labelList.forEach((lbl, i) => {
-      const card = document.createElement('div');
-      card.className = 'stat-card label-card';
-      card.style.borderColor = palette[i % palette.length] + '55';
-      card.innerHTML = `
-        <div class="slbl">${lbl}</div>
-        <div class="sval" style="color:${palette[i % palette.length]}">${counts[lbl] ?? 0}</div>`;
-      grid.appendChild(card);
+      const color = palette[i % palette.length];
+      const card  = document.createElement('div');
+      card.className = 'count-card';
+      card.style.borderColor = color + '44';
+      card.innerHTML = `<div class="clbl">${lbl}</div>
+        <div class="cval" style="color:${color}">${counts[lbl] ?? 0}</div>`;
+      row.appendChild(card);
     });
   }
 
-  // ── UI helpers ───────────────────────────────────────────────────────────
-  function setUIState(state) {
+  // ── Resource monitor ───────────────────────────────────────────────────────
+  let resTimer = null;
+  async function updateResources() {
+    try {
+      const d = await (await fetch('/resources')).json();
+      document.getElementById('r-cpu').textContent = d.cpu_percent + '%';
+      document.getElementById('b-cpu').style.width = d.cpu_percent + '%';
+      document.getElementById('r-ram').textContent = d.ram_percent + '%';
+      document.getElementById('b-ram').style.width = d.ram_percent + '%';
+      document.getElementById('r-ram-sub').textContent = `${d.ram_used_gb} / ${d.ram_total_gb} GB`;
+      if (d.gpu_util !== null) {
+        document.getElementById('r-gpu').textContent = d.gpu_util + '%';
+        document.getElementById('b-gpu').style.width = d.gpu_util + '%';
+      }
+      if (d.gpu_mem_used !== null) {
+        const pct = Math.round(d.gpu_mem_used / d.gpu_mem_total * 100);
+        document.getElementById('r-vram').textContent = pct + '%';
+        document.getElementById('b-vram').style.width = pct + '%';
+        document.getElementById('r-vram-sub').textContent = `${d.gpu_mem_used} / ${d.gpu_mem_total} MB`;
+      }
+    } catch(e) {}
+  }
+  updateResources();
+  resTimer = setInterval(updateResources, 2000);
+  function stopResourcePolling() { if (resTimer) { clearInterval(resTimer); resTimer = null; } }
+
+  // ── UI helpers ─────────────────────────────────────────────────────────────
+  function setUIState(s) {
     const pill  = document.getElementById('status-pill');
     const dot   = document.getElementById('status-dot');
     const txt   = document.getElementById('status-text');
     const start = document.getElementById('btn-start');
     const stop  = document.getElementById('btn-stop');
-
-    pill.className = 'status-pill';
-    dot.className  = 'dot';
-
-    if (state === 'running') {
-      pill.classList.add('running');
-      dot.classList.add('pulse');
-      txt.textContent    = 'Running';
+    const save  = document.getElementById('btn-save');
+    pill.className = 'status-pill'; dot.className = 'dot';
+    if (s === 'running') {
+      pill.classList.add('running'); dot.classList.add('pulse');
+      txt.textContent = 'Running';
       start.style.display = 'none';
       stop.style.display  = 'block';
-    } else if (state === 'starting' || state === 'stopping') {
-      txt.textContent     = state === 'starting' ? 'Starting...' : 'Stopping...';
-      start.disabled      = true;
-      stop.disabled       = true;
+      save.style.display  = 'block';
+      start.disabled = false; stop.disabled = false;
+    } else if (s === 'starting' || s === 'stopping') {
+      txt.textContent = s === 'starting' ? 'Starting...' : 'Stopping...';
+      start.disabled = true; stop.disabled = true;
     } else {
-      txt.textContent     = 'Idle';
-      start.style.display = 'block';
-      start.disabled      = false;
+      txt.textContent = 'Idle';
+      start.style.display = 'block'; start.disabled = false;
       stop.style.display  = 'none';
-      stop.disabled       = false;
+      save.style.display  = 'none';
+      stop.disabled = false;
     }
   }
 
   function showVideo() {
-    const feed = document.getElementById('video-feed');
-    feed.src = '/video?' + Date.now();
-    feed.style.display = 'block';
+    document.getElementById('video-feed').src = '/video?' + Date.now();
+    document.getElementById('video-feed').style.display = 'block';
     document.getElementById('video-placeholder').style.display = 'none';
   }
-
   function hideVideo() {
-    const feed = document.getElementById('video-feed');
-    feed.style.display = 'none';
-    feed.src = '';
+    const f = document.getElementById('video-feed');
+    f.style.display = 'none'; f.src = '';
     document.getElementById('video-placeholder').style.display = 'flex';
   }
-
   function resetStats() {
-    document.getElementById('s-fps').textContent    = '—';
-    document.getElementById('s-frames').textContent = '—';
-    document.getElementById('stats-grid').querySelectorAll('.label-card').forEach(el => el.remove());
+    document.getElementById('s-fps').textContent     = '—';
+    document.getElementById('s-frames').textContent  = '—';
+    document.getElementById('s-tracked').textContent = '—';
+    document.getElementById('counts-row').innerHTML  = '';
   }
-
   function showError(msg) {
     const el = document.getElementById('error-msg');
-    el.textContent    = '⚠ ' + msg;
-    el.style.display  = 'block';
+    el.textContent = '⚠ ' + msg; el.style.display = 'block';
+  }
+  function hideError() { document.getElementById('error-msg').style.display = 'none'; }
+
+  // ── Recordings ─────────────────────────────────────────────────────────────
+  async function loadRecordings() {
+    const list = document.getElementById('rec-list');
+    list.innerHTML = '<div class="rec-empty">Loading...</div>';
+    try {
+      const files = await (await fetch('/recordings')).json();
+      if (!files.length) {
+        list.innerHTML = '<div class="rec-empty">No recordings found.</div>';
+        return;
+      }
+      list.innerHTML = '';
+      files.forEach(f => {
+        const el = document.createElement('div');
+        el.className = 'rec-item';
+        el.innerHTML = `
+          <div class="rec-name">${f.name}</div>
+          <div class="rec-meta">
+            <span>${f.size_mb} MB</span>
+            <span>${f.modified}</span>
+          </div>`;
+        el.onclick = () => playRecording(f.name, el);
+        list.appendChild(el);
+      });
+    } catch(e) {
+      list.innerHTML = '<div class="rec-empty">Failed to load recordings.</div>';
+    }
   }
 
-  function hideError() {
-    document.getElementById('error-msg').style.display = 'none';
+  function playRecording(filename, el) {
+    document.querySelectorAll('.rec-item').forEach(i => i.classList.remove('selected'));
+    el.classList.add('selected');
+    const player = document.getElementById('rec-player');
+    const placeholder = document.getElementById('player-placeholder');
+    player.src = `/recordings/${filename}`;
+    player.style.display = 'block';
+    placeholder.style.display = 'none';
+    player.play();
   }
 
-  // ── Check if session already running on page load ────────────────────────
+  // ── Restore on reload ──────────────────────────────────────────────────────
   (async () => {
     try {
       const d = await (await fetch('/session/status')).json();
@@ -545,6 +626,7 @@
         setUIState('running');
         startPolling();
         showVideo();
+        if (d.saving) setSaveUI(true);
       }
     } catch(e) {}
   })();

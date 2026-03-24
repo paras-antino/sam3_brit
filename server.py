@@ -1,10 +1,11 @@
-import cv2, csv, time, threading, numpy as np, os
+import cv2, csv, time, threading, numpy as np, os, psutil, subprocess
 from PIL import Image as PILImage
 from collections import defaultdict
 from datetime import datetime
 import torch
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from typing import List
 import supervision as sv
@@ -14,56 +15,39 @@ from ultralytics.models.sam import SAM3SemanticPredictor
 # ── Config ────────────────────────────────────────────────────────────────────
 MODEL_PATH = "/home/paras/sam3/sam3.pt"
 OUTPUT_DIR = "/home/paras/sam3/outputs"
-SAVE_VIDEO = True
-SAVE_CSV   = True
+MAX_FRAMES = None
 
 # ── Session state ─────────────────────────────────────────────────────────────
 session = {
-    "running":    False,
-    "frame":      None,
-    "counts":     {},
-    "fps":        0.0,
-    "frame_idx":  0,
-    "error":      None,
-    "labels":     [],
-    "rtsp_url":   None,
-    "started_at": None,
+    "running":      False,
+    "frame":        None,
+    "counts":       {},
+    "fps":          0.0,
+    "frame_idx":    0,
+    "error":        None,
+    "labels":       [],
+    "rtsp_url":     None,
+    "started_at":   None,
+    "saving":       False,   # whether we are currently saving to disk
+    "save_path":    None,    # current video save path
 }
-session_lock = threading.Lock()
+session_lock   = threading.Lock()
 session_thread = None
 
 app = FastAPI()
 
-# ── Request model ─────────────────────────────────────────────────────────────
+# ── Request models ────────────────────────────────────────────────────────────
 class StartRequest(BaseModel):
     rtsp_url:   str
     labels:     List[str]
     confidence: float = 0.30
     every_n:    int   = 5
+    save:       bool  = False   # start saving immediately
 
-# ── Drawing helper ────────────────────────────────────────────────────────────
-def draw_panel(frame, counts, track_count, fps_val, labels):
-    panel_h = 50 + 28 * max(len(labels), 1)
-    cv2.rectangle(frame, (8,8), (280,panel_h), (15,15,15), -1)
-    cv2.rectangle(frame, (8,8), (280,panel_h), (55,55,55),  1)
-    cv2.putText(frame, f"SAM3+ByteTrack {fps_val:.1f}fps",
-                (14,26), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (150,150,150), 1)
-    cv2.putText(frame, f"Tracked: {track_count}",
-                (14,42), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (190,190,190), 1)
-    palette = [
-        (0,200,100),(255,165,0),(100,149,237),(200,50,200),
-        (0,200,200),(200,200,0),(255,80,80),(80,255,80),
-    ]
-    for idx, label in enumerate(labels):
-        color = palette[idx % len(palette)]
-        cnt   = counts.get(label, 0)
-        y     = 62 + idx * 28
-        cv2.rectangle(frame, (14,y-12), (26,y), color, -1)
-        cv2.putText(frame, f"{label}: {cnt}", (32,y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, (235,235,235), 1)
-    return frame
+class SaveRequest(BaseModel):
+    save: bool   # True = start saving, False = stop saving
 
-# ── Cleanup old output files ──────────────────────────────────────────────────
+# ── Cleanup old output files (30 min) ────────────────────────────────────────
 def cleanup_loop():
     while True:
         try:
@@ -81,23 +65,29 @@ def cleanup_loop():
         time.sleep(300)
 
 # ── Detection loop ────────────────────────────────────────────────────────────
-def detection_loop(rtsp_url, labels, confidence, every_n):
+def detection_loop(rtsp_url, labels, confidence, every_n, save_on_start):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+    # Load SAM3
     print("Loading SAM3...")
-    overrides = dict(conf=confidence, task="segment", mode="predict",
-                     model=MODEL_PATH, half=True, imgsz=644, verbose=False)
+    overrides = dict(
+        conf=confidence, task="segment", mode="predict",
+        model=MODEL_PATH, half=True, imgsz=644, verbose=False
+    )
     predictor = SAM3SemanticPredictor(overrides=overrides)
     print("SAM3 loaded")
 
+    # ByteTrack + annotators
     tracker   = ByteTrack(track_activation_threshold=0.25, lost_track_buffer=30,
                           minimum_matching_threshold=0.8, frame_rate=15)
     box_ann   = sv.BoxAnnotator(thickness=2)
     lbl_ann   = sv.LabelAnnotator(text_scale=0.5, text_thickness=1)
     trace_ann = sv.TraceAnnotator(thickness=2, trace_length=40)
 
+    # Open RTSP
     print(f"Connecting RTSP: {rtsp_url}")
     cap = cv2.VideoCapture(rtsp_url)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     if not cap.isOpened():
         with session_lock:
             session["error"]   = "Could not open RTSP stream"
@@ -110,27 +100,45 @@ def detection_loop(rtsp_url, labels, confidence, every_n):
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     print(f"Stream: {width}x{height} @ {fps}fps")
 
-    ts_str   = datetime.now().strftime("%Y%m%d_%H%M%S")
-    writer   = None
-    csv_file = None
+    # Save state (can be toggled at runtime)
+    writer     = None
+    csv_file   = None
+    csv_writer = None
 
-    if SAVE_VIDEO:
-        vpath  = f"{OUTPUT_DIR}/detection_{ts_str}.mp4"
-        writer = cv2.VideoWriter(vpath, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
-        print(f"Saving video: {vpath}")
-
-    if SAVE_CSV:
-        cpath      = f"{OUTPUT_DIR}/counts_{ts_str}.csv"
+    def open_writers(ts):
+        nonlocal writer, csv_file, csv_writer
+        vpath = f"{OUTPUT_DIR}/detection_{ts}.mp4"
+        cpath = f"{OUTPUT_DIR}/counts_{ts}.csv"
+        writer     = cv2.VideoWriter(vpath, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
         csv_file   = open(cpath, "w", newline="")
         csv_writer = csv.writer(csv_file)
         csv_writer.writerow(["frame","timestamp"] + labels + ["total_tracks","fps"])
-        print(f"Saving CSV: {cpath}")
+        with session_lock:
+            session["save_path"] = vpath
+        print(f"Saving video : {vpath}")
+        print(f"Saving CSV   : {cpath}")
+
+    def close_writers():
+        nonlocal writer, csv_file, csv_writer
+        if writer:   writer.release();   writer = None
+        if csv_file: csv_file.close();   csv_file = None
+        csv_writer = None
+        with session_lock:
+            session["save_path"] = None
+        print("Stopped saving")
+
+    if save_on_start:
+        open_writers(datetime.now().strftime("%Y%m%d_%H%M%S"))
+        with session_lock:
+            session["saving"] = True
 
     frame_idx    = 0
     t_start      = time.time()
     t_frame      = time.time()
     fps_display  = 0.0
     last_sv_dets = sv.Detections.empty()
+    palette      = [(0,200,100),(255,165,0),(100,149,237),(200,50,200),
+                    (0,200,200),(200,200,0),(255,80,80),(80,255,80)]
 
     with session_lock:
         session["running"]    = True
@@ -139,18 +147,35 @@ def detection_loop(rtsp_url, labels, confidence, every_n):
 
     try:
         while True:
-            # Stop signal from /session/stop
+            # ── Check stop / save-toggle signals ─────────────────────────────
             with session_lock:
-                if not session["running"]:
-                    print("Stop signal received")
-                    break
+                should_run  = session["running"]
+                should_save = session["saving"]
 
+            if not should_run:
+                print("Stop signal received")
+                break
+
+            # Toggle saving on/off at runtime
+            if should_save and writer is None:
+                open_writers(datetime.now().strftime("%Y%m%d_%H%M%S"))
+            elif not should_save and writer is not None:
+                close_writers()
+
+            # ── Read frame ───────────────────────────────────────────────────
             ret, frame = cap.read()
             if not ret:
+                with session_lock:
+                    if not session["running"]:
+                        break
                 print("Stream lost, reconnecting...")
                 cap.release()
                 time.sleep(2)
+                with session_lock:
+                    if not session["running"]:
+                        break
                 cap = cv2.VideoCapture(rtsp_url)
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                 if not cap.isOpened():
                     print("Reconnect failed")
                     break
@@ -159,7 +184,7 @@ def detection_loop(rtsp_url, labels, confidence, every_n):
             if MAX_FRAMES and frame_idx >= MAX_FRAMES:
                 break
 
-            # SAM3 every N frames
+            # ── SAM3 every N frames ──────────────────────────────────────────
             if frame_idx % every_n == 0:
                 rgb  = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 pil  = PILImage.fromarray(rgb)
@@ -174,12 +199,10 @@ def detection_loop(rtsp_url, labels, confidence, every_n):
                 else:
                     last_sv_dets = sv.Detections.empty()
 
-            # ByteTrack every frame
+            # ── ByteTrack every frame ────────────────────────────────────────
             tracked     = tracker.update_with_detections(last_sv_dets)
             counts      = defaultdict(int)
             label_texts = []
-            palette     = [(0,200,100),(255,165,0),(100,149,237),(200,50,200),
-                           (0,200,200),(200,200,0),(255,80,80),(80,255,80)]
 
             for tid, cls_id, conf in zip(
                 tracked.tracker_id if tracked.tracker_id is not None else [],
@@ -189,31 +212,30 @@ def detection_loop(rtsp_url, labels, confidence, every_n):
                 counts[name] += 1
                 label_texts.append(f"#{tid} {name} {conf:.2f}")
 
+            # ── Annotate (no panel overlay — stats shown in UI) ──────────────
             annotated = frame.copy()
             annotated = trace_ann.annotate(annotated, tracked)
             annotated = box_ann.annotate(annotated, tracked)
             if label_texts:
                 annotated = lbl_ann.annotate(annotated, tracked, labels=label_texts)
 
+            # ── FPS ──────────────────────────────────────────────────────────
             now         = time.time()
             fps_display = 1.0 / max(now - t_frame, 1e-6)
             t_frame     = now
-            annotated   = draw_panel(annotated, counts, len(tracked), fps_display, labels)
             elapsed     = now - t_start
-            cv2.putText(annotated,
-                        f"Frame {frame_idx:05d} | {time.strftime('%H:%M:%S', time.gmtime(elapsed))}",
-                        (10, height-10), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (150,150,150), 1)
 
+            # ── Push to browser ──────────────────────────────────────────────
             with session_lock:
                 session["frame"]     = annotated.copy()
                 session["counts"]    = dict(counts)
                 session["fps"]       = fps_display
                 session["frame_idx"] = frame_idx
 
+            # ── Write to disk if saving ──────────────────────────────────────
             if writer:
                 writer.write(annotated)
-
-            if csv_file:
+            if csv_writer:
                 row = [frame_idx, round(elapsed,2)]
                 row += [counts.get(l,0) for l in labels]
                 row += [len(tracked), round(fps_display,2)]
@@ -230,10 +252,10 @@ def detection_loop(rtsp_url, labels, confidence, every_n):
         print(f"ERROR: {e}")
     finally:
         cap.release()
-        if writer:   writer.release()
-        if csv_file: csv_file.close()
+        close_writers()
         with session_lock:
             session["running"] = False
+            session["saving"]  = False
         print("Detection loop stopped")
 
 # ── API endpoints ─────────────────────────────────────────────────────────────
@@ -242,20 +264,22 @@ def start_session(req: StartRequest):
     global session_thread
     with session_lock:
         if session["running"]:
-            raise HTTPException(status_code=409, detail="A session is already running. Stop it first.")
+            raise HTTPException(status_code=409, detail="Session already running. Stop it first.")
         if not req.labels:
             raise HTTPException(status_code=400, detail="Provide at least one label.")
-        session["labels"]   = req.labels
-        session["rtsp_url"] = req.rtsp_url
-        session["frame"]    = None
-        session["counts"]   = {}
-        session["fps"]      = 0.0
-        session["frame_idx"]= 0
-        session["error"]    = None
+        session["labels"]    = req.labels
+        session["rtsp_url"]  = req.rtsp_url
+        session["frame"]     = None
+        session["counts"]    = {}
+        session["fps"]       = 0.0
+        session["frame_idx"] = 0
+        session["error"]     = None
+        session["saving"]    = req.save
+        session["save_path"] = None
 
     session_thread = threading.Thread(
         target=detection_loop,
-        args=(req.rtsp_url, req.labels, req.confidence, req.every_n),
+        args=(req.rtsp_url, req.labels, req.confidence, req.every_n, req.save),
         daemon=True
     )
     session_thread.start()
@@ -268,7 +292,26 @@ def stop_session():
         if not session["running"]:
             return {"status": "not running"}
         session["running"] = False
+        session["saving"]  = False
+
+    def force_clear():
+        time.sleep(4)
+        with session_lock:
+            session["frame"]     = None
+            session["counts"]    = {}
+            session["fps"]       = 0.0
+            session["frame_idx"] = 0
+    threading.Thread(target=force_clear, daemon=True).start()
     return {"status": "stopping"}
+
+
+@app.post("/session/save")
+def toggle_save(req: SaveRequest):
+    with session_lock:
+        if not session["running"]:
+            raise HTTPException(status_code=400, detail="No session running.")
+        session["saving"] = req.save
+    return {"status": "saving" if req.save else "not saving"}
 
 
 @app.get("/session/status")
@@ -283,7 +326,43 @@ def session_status():
             "frame_idx":  session["frame_idx"],
             "started_at": session["started_at"],
             "error":      session["error"],
+            "saving":     session["saving"],
+            "save_path":  session["save_path"],
         })
+
+
+@app.get("/recordings")
+def list_recordings():
+    files = []
+    if os.path.exists(OUTPUT_DIR):
+        for fname in sorted(os.listdir(OUTPUT_DIR), reverse=True):
+            if not fname.endswith(".mp4"):
+                continue
+            fpath = os.path.join(OUTPUT_DIR, fname)
+            stat  = os.stat(fpath)
+            files.append({
+                "name":     fname,
+                "size_mb":  round(stat.st_size / 1e6, 1),
+                "modified": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+            })
+    return JSONResponse(files)
+
+
+@app.get("/recordings/{filename}")
+def stream_recording(filename: str):
+    # Prevent path traversal
+    filename = os.path.basename(filename)
+    fpath    = os.path.join(OUTPUT_DIR, filename)
+    if not os.path.exists(fpath):
+        raise HTTPException(status_code=404, detail="File not found")
+
+    def iter_file():
+        with open(fpath, "rb") as f:
+            while chunk := f.read(1024 * 256):
+                yield chunk
+
+    return StreamingResponse(iter_file(), media_type="video/mp4",
+                             headers={"Content-Disposition": f"inline; filename={filename}"})
 
 
 @app.get("/video")
@@ -293,14 +372,42 @@ def video_feed():
             with session_lock:
                 frame = session["frame"]
             if frame is None:
-                blank = np.zeros((480,640,3), dtype=np.uint8)
-                cv2.putText(blank, "Waiting for stream...", (120,240),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (80,80,80), 2)
+                blank = np.zeros((360,640,3), dtype=np.uint8)
+                cv2.putText(blank, "Waiting for stream...", (140,180),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (60,60,60), 2)
                 frame = blank
             _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
             yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + buf.tobytes() + b"\r\n"
             time.sleep(0.033)
     return StreamingResponse(generate(), media_type="multipart/x-mixed-replace; boundary=frame")
+
+
+@app.get("/resources")
+def resources():
+    cpu = psutil.cpu_percent(interval=None)
+    ram = psutil.virtual_memory()
+    gpu_util = gpu_mem_used = gpu_mem_total = None
+    try:
+        result = subprocess.check_output([
+            "nvidia-smi",
+            "--query-gpu=utilization.gpu,memory.used,memory.total",
+            "--format=csv,noheader,nounits"
+        ]).decode().strip()
+        parts         = result.split(",")
+        gpu_util      = int(parts[0].strip())
+        gpu_mem_used  = int(parts[1].strip())
+        gpu_mem_total = int(parts[2].strip())
+    except Exception:
+        pass
+    return JSONResponse({
+        "cpu_percent":  round(cpu, 1),
+        "ram_percent":  round(ram.percent, 1),
+        "ram_used_gb":  round(ram.used / 1e9, 1),
+        "ram_total_gb": round(ram.total / 1e9, 1),
+        "gpu_util":     gpu_util,
+        "gpu_mem_used": gpu_mem_used,
+        "gpu_mem_total":gpu_mem_total,
+    })
 
 
 @app.get("/health")
@@ -321,4 +428,4 @@ def index():
 @app.on_event("startup")
 def startup():
     threading.Thread(target=cleanup_loop, daemon=True).start()
-    print("SAM3 server ready — waiting for session start")
+    print("SAM3 server ready")
