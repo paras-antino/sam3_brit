@@ -108,7 +108,7 @@ def detection_loop(rtsp_url, labels, confidence, every_n, save_on_start):
     csv_writer = None
 
     def open_writers(ts):
-    nonlocal writer, csv_file, csv_writer
+        nonlocal writer, csv_file, csv_writer
     vpath = f"{OUTPUT_DIR}/detection_{ts}.mp4"
     cpath = f"{OUTPUT_DIR}/counts_{ts}.csv"
 
