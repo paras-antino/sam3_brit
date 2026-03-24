@@ -140,7 +140,7 @@ def detection_loop(rtsp_url, labels, confidence, every_n, save_on_start):
     print(f"Saving CSV   : {cpath}")
 
     def close_writers():
-    nonlocal writer, csv_file, csv_writer
+        nonlocal writer, csv_file, csv_writer
     if writer:
         writer.stdin.close()
         writer.wait()
