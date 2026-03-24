@@ -68,26 +68,37 @@ class SaveRequest(BaseModel):
 
 
 # ── Writer helpers ────────────────────────────────────────────────────────────
+#
+# Strategy:
+#   1. Record into a .mkv scratch file while streaming.
+#      MKV is a streamable container — it never needs a trailer/index written
+#      at the end, so a crash or pipe-break still leaves a playable file.
+#   2. On close, remux the .mkv → .mp4 with "-movflags +faststart" so the
+#      moov atom lands at the front of the file.  Without faststart, mp4
+#      puts the moov atom at the END and browsers cannot play the file until
+#      the entire download completes.
+#
 def open_writers(ts: str, labels_list: list, width: int, height: int, fps: float):
     """Start ffmpeg process + CSV file.  Must NOT be called while holding session_lock."""
     global writer, csv_file, csv_writer
 
-    vpath = os.path.join(OUTPUT_DIR, f"detection_{ts}.mp4")
-    cpath = os.path.join(OUTPUT_DIR, f"counts_{ts}.csv")
+    # Write to MKV scratch — stream-safe, no moov-at-end problem
+    scratch = os.path.join(OUTPUT_DIR, f"detection_{ts}.mkv")
+    cpath   = os.path.join(OUTPUT_DIR, f"counts_{ts}.csv")
 
     ffmpeg_cmd = [
         "ffmpeg", "-y",
-        "-f", "rawvideo",
-        "-vcodec", "rawvideo",
+        "-f",       "rawvideo",
+        "-vcodec",  "rawvideo",
         "-pix_fmt", "bgr24",
-        "-s", f"{width}x{height}",
-        "-r", str(int(fps)),
-        "-i", "pipe:0",
+        "-s",       f"{width}x{height}",
+        "-r",       str(int(fps)),
+        "-i",       "pipe:0",
         "-codec:v", "libx264",
-        "-preset", "ultrafast",
-        "-crf", "23",
+        "-preset",  "ultrafast",
+        "-crf",     "23",
         "-pix_fmt", "yuv420p",
-        vpath,
+        scratch,
     ]
 
     with writer_lock:
@@ -97,7 +108,7 @@ def open_writers(ts: str, labels_list: list, width: int, height: int, fps: float
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
         )
-        print(f"[ffmpeg] started PID={new_proc.pid}")
+        print(f"[ffmpeg] started PID={new_proc.pid}  scratch={scratch}")
 
         new_csv = open(cpath, "w", newline="")
         new_cw  = csv.writer(new_csv)
@@ -107,23 +118,51 @@ def open_writers(ts: str, labels_list: list, width: int, height: int, fps: float
         csv_file   = new_csv
         csv_writer = new_cw
 
-    # Update session path separately to keep lock ordering consistent
+    # Expose the scratch path so the UI can show "recording…"
     with session_lock:
-        session["save_path"] = vpath
+        session["save_path"] = scratch
 
-    print(f"[writer] video → {vpath}")
-    print(f"[writer] CSV   → {cpath}")
+    print(f"[writer] scratch → {scratch}")
+    print(f"[writer] CSV     → {cpath}")
+
+
+def _remux_to_mp4(scratch: str) -> str:
+    """Remux MKV scratch file → browser-playable MP4 with moov atom at front.
+    Runs synchronously in a background thread after close_writers()."""
+    mp4_path = scratch.replace(".mkv", ".mp4")
+    cmd = [
+        "ffmpeg", "-y",
+        "-i",        scratch,
+        "-codec",    "copy",          # no re-encode — just rewrap
+        "-movflags", "+faststart",    # moov atom at front → browser can play immediately
+        mp4_path,
+    ]
+    print(f"[remux] {scratch} → {mp4_path}")
+    result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    if result.returncode == 0:
+        os.remove(scratch)            # delete scratch only on success
+        print(f"[remux] done → {mp4_path}")
+        return mp4_path
+    else:
+        err = result.stderr.decode(errors="replace")
+        print(f"[remux] FAILED: {err}")
+        return scratch                # fall back to mkv if remux fails
 
 
 def close_writers():
-    """Flush and close ffmpeg + CSV.  Safe to call even if already closed."""
+    """Flush and close ffmpeg + CSV, then remux to browser-playable MP4.
+    Safe to call even if already closed."""
     global writer, csv_file, csv_writer
+
+    scratch_path = None
 
     with writer_lock:
         if writer is not None:
             try:
                 writer.stdin.close()
                 writer.wait()
+                # Capture the scratch path from stderr/argv isn't easy here,
+                # so we derive it from session (set in open_writers).
             except Exception as exc:
                 print(f"[ffmpeg] close error: {exc}")
             writer = None
@@ -137,10 +176,16 @@ def close_writers():
 
         csv_writer = None
 
+    # Grab the scratch path before clearing it
     with session_lock:
+        scratch_path = session.get("save_path")
         session["save_path"] = None
 
     print("[writer] closed")
+
+    # Remux MKV → MP4 in a background thread so we don't block the detection loop
+    if scratch_path and scratch_path.endswith(".mkv") and os.path.exists(scratch_path):
+        threading.Thread(target=_remux_to_mp4, args=(scratch_path,), daemon=True).start()
 
 
 # ── Background cleanup (delete files older than 30 min) ──────────────────────
@@ -150,7 +195,7 @@ def cleanup_loop():
             cutoff = time.time() - 30 * 60
             if os.path.exists(OUTPUT_DIR):
                 for fname in os.listdir(OUTPUT_DIR):
-                    if not (fname.endswith(".mp4") or fname.endswith(".csv")):
+                    if not (fname.endswith(".mp4") or fname.endswith(".mkv") or fname.endswith(".csv")):
                         continue
                     fpath = os.path.join(OUTPUT_DIR, fname)
                     if os.path.getmtime(fpath) < cutoff:
@@ -436,7 +481,7 @@ def list_recordings():
     files = []
     if os.path.exists(OUTPUT_DIR):
         for fname in sorted(os.listdir(OUTPUT_DIR), reverse=True):
-            if not fname.endswith(".mp4"):
+            if not (fname.endswith(".mp4") or fname.endswith(".mkv")):
                 continue
             fpath = os.path.join(OUTPUT_DIR, fname)
             stat  = os.stat(fpath)
@@ -448,8 +493,10 @@ def list_recordings():
     return JSONResponse(files)
 
 
+CHUNK_SIZE = 1024 * 256  # 256 KB per read — fast seek, low memory
+
 @app.api_route("/recordings/{filename}", methods=["GET", "HEAD"])
-def stream_recording(filename: str, request: Request):
+async def stream_recording(filename: str, request: Request):
     filename = os.path.basename(filename)   # prevent path traversal
     fpath    = os.path.join(OUTPUT_DIR, filename)
     if not os.path.exists(fpath):
@@ -457,42 +504,75 @@ def stream_recording(filename: str, request: Request):
 
     file_size    = os.path.getsize(fpath)
     range_header = request.headers.get("range")
+    mime_type    = "video/mp4" if filename.endswith(".mp4") else "video/x-matroska"
 
+    # HEAD — browser uses this to discover file size and range support
     if request.method == "HEAD":
         return Response(
             status_code=200,
-            media_type="video/mp4",
-            headers={"Accept-Ranges": "bytes", "Content-Length": str(file_size)},
+            media_type=mime_type,
+            headers={
+                "Accept-Ranges":  "bytes",
+                "Content-Length": str(file_size),
+                "Content-Type":   mime_type,
+            },
         )
 
+    # Range request — browsers ALWAYS use this for <video> seek/play
     if range_header:
-        range_val  = range_header.strip().lower().replace("bytes=", "")
-        parts      = range_val.split("-")
-        start      = int(parts[0]) if parts[0] else 0
-        end        = int(parts[1]) if len(parts) > 1 and parts[1] else file_size - 1
+        range_val = range_header.strip().lower().replace("bytes=", "")
+        parts     = range_val.split("-")
+        start     = int(parts[0]) if parts[0] else 0
+        # If end is omitted (e.g. "bytes=0-"), serve up to 2 MB so the
+        # browser gets the moov atom quickly without reading the whole file.
+        if len(parts) > 1 and parts[1]:
+            end = int(parts[1])
+        else:
+            end = min(start + CHUNK_SIZE * 8 - 1, file_size - 1)
         end        = min(end, file_size - 1)
         chunk_size = end - start + 1
-        with open(fpath, "rb") as f:
-            f.seek(start)
-            data = f.read(chunk_size)
-        return Response(
-            content=data,
+
+        def _iter_range():
+            remaining = chunk_size
+            with open(fpath, "rb") as f:
+                f.seek(start)
+                while remaining > 0:
+                    data = f.read(min(CHUNK_SIZE, remaining))
+                    if not data:
+                        break
+                    remaining -= len(data)
+                    yield data
+
+        return StreamingResponse(
+            _iter_range(),
             status_code=206,
-            media_type="video/mp4",
+            media_type=mime_type,
             headers={
                 "Content-Range":  f"bytes {start}-{end}/{file_size}",
                 "Accept-Ranges":  "bytes",
                 "Content-Length": str(chunk_size),
+                "Content-Type":   mime_type,
             },
         )
 
-    with open(fpath, "rb") as f:
-        data = f.read()
-    return Response(
-        content=data,
+    # No Range header — stream the whole file in chunks
+    def _iter_full():
+        with open(fpath, "rb") as f:
+            while True:
+                data = f.read(CHUNK_SIZE)
+                if not data:
+                    break
+                yield data
+
+    return StreamingResponse(
+        _iter_full(),
         status_code=200,
-        media_type="video/mp4",
-        headers={"Accept-Ranges": "bytes", "Content-Length": str(file_size)},
+        media_type=mime_type,
+        headers={
+            "Accept-Ranges":  "bytes",
+            "Content-Length": str(file_size),
+            "Content-Type":   mime_type,
+        },
     )
 
 
