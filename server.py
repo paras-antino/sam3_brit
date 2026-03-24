@@ -36,6 +36,12 @@ session = {
 session_lock   = threading.Lock()
 session_thread = None
 
+# ── Global writer state ───────────────────────────────────────────────────────
+writer     = None
+csv_file   = None
+csv_writer = None
+writer_lock = threading.Lock()
+
 app = FastAPI()
 
 # ── Request models ────────────────────────────────────────────────────────────
@@ -48,7 +54,68 @@ class StartRequest(BaseModel):
 
 class SaveRequest(BaseModel):
     save: bool   # True = start saving, False = stop saving
+# ── Writer functions (global scope) ──────────────────────────────────────────
+def open_writers(ts, labels_list, width, height, fps):
+    global writer, csv_file, csv_writer
+    
+    with writer_lock:
+        vpath = f"{OUTPUT_DIR}/detection_{ts}.mp4"
+        cpath = f"{OUTPUT_DIR}/counts_{ts}.csv"
 
+        ffmpeg_cmd = [
+            'ffmpeg', '-y',
+            '-f', 'rawvideo',
+            '-vcodec', 'rawvideo',
+            '-pix_fmt', 'bgr24',
+            '-s', f'{width}x{height}',
+            '-r', str(int(fps)),
+            '-i', 'pipe:0',
+            '-codec:v', 'libx264',
+            '-preset', 'ultrafast',
+            '-crf', '23',
+            '-pix_fmt', 'yuv420p',
+            vpath
+        ]
+
+        writer = subprocess.Popen(
+            ffmpeg_cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE
+        )
+
+        print(f"[DEBUG] ffmpeg started PID={writer.pid}")
+
+        csv_file = open(cpath, "w", newline="")
+        csv_writer = csv.writer(csv_file)
+        csv_writer.writerow(["frame", "timestamp"] + labels_list + ["total_tracks", "fps"])
+        
+        with session_lock:
+            session["save_path"] = vpath
+        
+        print(f"Saving video : {vpath}")
+        print(f"Saving CSV   : {cpath}")
+
+
+def close_writers():
+    global writer, csv_file, csv_writer
+    
+    with writer_lock:
+        if writer:
+            writer.stdin.close()
+            writer.wait()
+            writer = None
+
+        if csv_file:
+            csv_file.close()
+            csv_file = None
+
+        csv_writer = None
+        
+        with session_lock:
+            session["save_path"] = None
+        
+        print("[DEBUG] writers closed")
 # ── Cleanup old output files (30 min) ────────────────────────────────────────
 def cleanup_loop():
     while True:
@@ -102,69 +169,8 @@ def detection_loop(rtsp_url, labels, confidence, every_n, save_on_start):
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     print(f"Stream: {width}x{height} @ {fps}fps")
 
-    # Save state (can be toggled at runtime)
-    writer     = None
-    csv_file   = None
-    csv_writer = None
-
-    def open_writers(ts):
-        nonlocal writer, csv_file, csv_writer
-        vpath = f"{OUTPUT_DIR}/detection_{ts}.mp4"
-        cpath = f"{OUTPUT_DIR}/counts_{ts}.csv"
-
-        ffmpeg_cmd = [
-            'ffmpeg', '-y',
-            '-f', 'rawvideo',
-            '-vcodec', 'rawvideo',
-            '-pix_fmt', 'bgr24',
-            '-s', f'{width}x{height}',
-            '-r', str(int(fps)),
-            '-i', 'pipe:0',
-            '-codec:v', 'libx264',
-            '-preset', 'ultrafast',
-            '-crf', '23',
-            '-pix_fmt', 'yuv420p',
-            vpath
-        ]
-        writer = subprocess.Popen(
-            ffmpeg_cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE
-        )
-        def log_ffmpeg_err(proc):
-            for line in proc.stderr:
-                print(f"[ffmpeg] {line.decode().strip()}")
-        threading.Thread(target=log_ffmpeg_err, args=(writer,), daemon=True).start()
-
-        csv_file   = open(cpath, "w", newline="")
-        csv_writer = csv.writer(csv_file)
-        csv_writer.writerow(["frame","timestamp"] + labels + ["total_tracks","fps"])
-        with session_lock:
-            session["save_path"] = vpath
-        print(f"Saving video : {vpath}")
-        print(f"Saving CSV   : {cpath}")
-        def close_writers():
-            nonlocal writer, csv_file, csv_writer
-        if writer:
-            writer.stdin.close()
-            writer.wait()
-            writer = None
-        if csv_file:
-            csv_file.close()
-            csv_file = None
-        csv_writer = None
-        with session_lock:
-            session["save_path"] = None
-        print("Stopped saving")
-
     if save_on_start:
-        open_writers(datetime.now().strftime("%Y%m%d_%H%M%S"))
-        with session_lock:
-            session["saving"] = True
-
-    frame_idx    = 0
-    t_start      = time.time()
+        open_writers(datetime.now().strftime("%Y%m%d_%H%M%S"), labels, width, height, fps)
     t_frame      = time.time()
     fps_display  = 0.0
     last_sv_dets = sv.Detections.empty()
@@ -189,7 +195,7 @@ def detection_loop(rtsp_url, labels, confidence, every_n, save_on_start):
 
             # Toggle saving on/off at runtime
             if should_save and writer is None:
-                open_writers(datetime.now().strftime("%Y%m%d_%H%M%S"))
+                open_writers(datetime.now().strftime("%Y%m%d_%H%M%S"), labels, width, height, fps)
             elif not should_save and writer is not None:
                 close_writers()
 
@@ -264,11 +270,22 @@ def detection_loop(rtsp_url, labels, confidence, every_n, save_on_start):
                 session["frame_idx"] = frame_idx
 
             # ── Write to disk if saving ──────────────────────────────────────
-            if writer and writer.stdin:
+            with session_lock:
+                currently_saving = session["saving"]
+
+            if currently_saving and writer is not None:
                 try:
                     writer.stdin.write(annotated.tobytes())
+                    writer.stdin.flush()
                 except BrokenPipeError:
-                    pass
+                    print("[ffmpeg] Broken pipe")
+                    writer = None
+                    with session_lock:
+                        session["saving"] = False
+
+            elif currently_saving and writer is None:
+                print(f"[DEBUG] saving=True but writer None frame={frame_idx}")
+            
             if csv_writer:
                 row = [frame_idx, round(elapsed,2)]
                 row += [counts.get(l,0) for l in labels]
