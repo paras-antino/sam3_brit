@@ -277,6 +277,81 @@ def _scale_boxes(xyxy: np.ndarray, sx: float, sy: float) -> np.ndarray:
     return out
 
 
+# ── Pre-inference quality enhancement ────────────────────────────────────────
+# Applied to every tile before SAM3 sees it.
+# 1. CLAHE on the LAB L-channel — lifts local contrast so faint cap/glove
+#    boundaries become visible without blowing out highlights elsewhere.
+# 2. Unsharp mask — sharpens edges so small distant objects have crisp borders.
+
+_CLAHE = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+
+
+def _enhance(img: np.ndarray) -> np.ndarray:
+    lab     = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    l       = _CLAHE.apply(l)
+    out     = cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
+    blur    = cv2.GaussianBlur(out, (0, 0), sigmaX=2.0)
+    return cv2.addWeighted(out, 1.6, blur, -0.6, 0)
+
+
+# ── SAHI: tiled inference ─────────────────────────────────────────────────────
+# Divides the frame into overlapping tiles and runs SAM3 on each one.
+# A person 50 m away may be only ~20 px tall in a 1080p frame.  With 2×2
+# tiling each tile covers half the width/height, so that same person is ~38 px
+# inside the tile — almost 2× the effective resolution for SAM3.
+
+def _run_sahi(frame: np.ndarray, predictor, labels: list,
+              n_cols: int, n_rows: int, overlap: float = 0.20) -> sv.Detections:
+    fh, fw   = frame.shape[:2]
+    tile_w   = int(fw / (n_cols - overlap * (n_cols - 1)))
+    tile_h   = int(fh / (n_rows - overlap * (n_rows - 1)))
+    stride_x = int(tile_w * (1 - overlap))
+    stride_y = int(tile_h * (1 - overlap))
+
+    all_boxes, all_confs, all_cls = [], [], []
+
+    for row in range(n_rows):
+        for col in range(n_cols):
+            x1 = col * stride_x
+            y1 = row * stride_y
+            x2 = min(x1 + tile_w, fw)
+            y2 = min(y1 + tile_h, fh)
+            tile = frame[y1:y2, x1:x2]
+            if tile.size == 0:
+                continue
+
+            tile = _enhance(tile)
+            pil  = PILImage.fromarray(cv2.cvtColor(tile, cv2.COLOR_BGR2RGB))
+            try:
+                predictor.set_image(pil)
+                results = predictor(text=labels)
+            except Exception as exc:
+                print(f"[sahi] tile({row},{col}) error: {exc}")
+                continue
+
+            if results and results[0].boxes is not None:
+                r     = results[0]
+                boxes = r.boxes.xyxy.cpu().numpy().copy()
+                boxes[:, [0, 2]] += x1
+                boxes[:, [1, 3]] += y1
+                boxes[:, [0, 2]]  = np.clip(boxes[:, [0, 2]], 0, fw)
+                boxes[:, [1, 3]]  = np.clip(boxes[:, [1, 3]], 0, fh)
+                all_boxes.append(boxes)
+                all_confs.append(r.boxes.conf.cpu().numpy())
+                all_cls.append(r.boxes.cls.cpu().numpy().astype(int))
+
+    if not all_boxes:
+        return sv.Detections.empty()
+
+    merged = sv.Detections(
+        xyxy=np.vstack(all_boxes),
+        confidence=np.hstack(all_confs),
+        class_id=np.hstack(all_cls),
+    )
+    return merged.with_nms(threshold=0.45)
+
+
 # ── Detection loop ────────────────────────────────────────────────────────────
 def detection_loop(rtsp_url: str, labels: list, confidence: float,
                    every_n: int, save_on_start: bool):
@@ -286,7 +361,7 @@ def detection_loop(rtsp_url: str, labels: list, confidence: float,
     print("[sam3] loading model...")
     overrides = dict(
         conf=confidence, task="segment", mode="predict",
-        model=MODEL_PATH, half=True, imgsz=644, verbose=False,
+        model=MODEL_PATH, half=True, imgsz=1024, verbose=False,
     )
     predictor = SAM3SemanticPredictor(overrides=overrides)
     print("[sam3] model loaded")
@@ -317,6 +392,11 @@ def detection_loop(rtsp_url: str, labels: list, confidence: float,
     height     = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     print(f"[rtsp] {width}x{height} @ {stream_fps:.1f} fps")
 
+    # 2×2 tiles for ≤1080p, 3×3 for 4K — each tile is processed independently
+    n_cols = 3 if width  > 2560 else 2
+    n_rows = 3 if height > 1440 else 2
+    print(f"[sahi] {n_cols}×{n_rows} tile grid")
+
     # ── Open writers if requested at start ────────────────────────────────────
     if save_on_start:
         open_writers(datetime.now().strftime("%Y%m%d_%H%M%S"),
@@ -324,12 +404,62 @@ def detection_loop(rtsp_url: str, labels: list, confidence: float,
         with session_lock:
             session["saving"] = True   # keep flag in sync
 
+    # ── Async inference thread ─────────────────────────────────────────────────
+    # SAHI + SR can take 500-1500 ms per cycle.  Running inference in a
+    # background thread keeps the annotation loop smooth at full stream FPS
+    # while ByteTrack always has the latest available detections.
+    infer = {
+        "running": True,
+        "frame":   None,
+        "dets":    sv.Detections.empty(),
+        "lock":    threading.Lock(),
+        "event":   threading.Event(),
+    }
+
+    def _inference_worker():
+        while infer["running"]:
+            infer["event"].wait(timeout=1.0)
+            infer["event"].clear()
+            if not infer["running"]:
+                break
+            with infer["lock"]:
+                f = infer["frame"]
+            if f is None:
+                continue
+            t0 = time.time()
+            try:
+                # Optional SR upscale before SAHI
+                if upsampler is not None:
+                    f_sr   = _apply_sr(f, upsampler)
+                    sr_h, sr_w = f_sr.shape[:2]
+                    sx = f.shape[1] / sr_w
+                    sy = f.shape[0] / sr_h
+                    nc = 3 if sr_w > 2560 else 2
+                    nr = 3 if sr_h > 1440 else 2
+                    dets = _run_sahi(f_sr, predictor, labels, nc, nr)
+                    if len(dets) > 0:
+                        dets = sv.Detections(
+                            xyxy=_scale_boxes(dets.xyxy, sx, sy),
+                            confidence=dets.confidence,
+                            class_id=dets.class_id,
+                        )
+                else:
+                    dets = _run_sahi(f, predictor, labels, n_cols, n_rows)
+                print(f"[infer] {len(dets)} dets  {(time.time()-t0)*1000:.0f} ms")
+            except Exception as exc:
+                print(f"[infer] error: {exc}")
+                dets = sv.Detections.empty()
+            with infer["lock"]:
+                infer["dets"] = dets
+
+    infer_thread = threading.Thread(target=_inference_worker, daemon=True)
+    infer_thread.start()
+
     # ── Loop state ────────────────────────────────────────────────────────────
-    frame_idx    = 0
-    t_start      = time.time()
-    t_frame      = t_start
-    fps_display  = 0.0
-    last_sv_dets = sv.Detections.empty()
+    frame_idx   = 0
+    t_start     = time.time()
+    t_frame     = t_start
+    fps_display = 0.0
 
     with session_lock:
         session["running"]    = True
@@ -347,7 +477,6 @@ def detection_loop(rtsp_url: str, labels: list, confidence: float,
                 print("[loop] stop signal received")
                 break
 
-            # Read writer state under lock — no direct global access in this function
             with writer_lock:
                 writer_active = writer is not None
 
@@ -379,34 +508,15 @@ def detection_loop(rtsp_url: str, labels: list, confidence: float,
             if MAX_FRAMES and frame_idx >= MAX_FRAMES:
                 break
 
-            # ── SAM3 inference every N frames ─────────────────────────────────
+            # ── Trigger async inference every N frames ─────────────────────────
             if frame_idx % every_n == 0:
-                # Optional SR upscale before SAM3 sees the frame
-                if upsampler is not None:
-                    infer_frame = _apply_sr(frame, upsampler)
-                    sr_h, sr_w  = infer_frame.shape[:2]
-                    sx = frame.shape[1] / sr_w
-                    sy = frame.shape[0] / sr_h
-                else:
-                    infer_frame = frame
-                    sx = sy = 1.0
+                with infer["lock"]:
+                    infer["frame"] = frame.copy()
+                infer["event"].set()
 
-                rgb = cv2.cvtColor(infer_frame, cv2.COLOR_BGR2RGB)
-                pil = PILImage.fromarray(rgb)
-                predictor.set_image(pil)
-                results = predictor(text=labels)
-                if results and results[0].boxes is not None:
-                    r    = results[0]
-                    xyxy = r.boxes.xyxy.cpu().numpy()
-                    if sx != 1.0:
-                        xyxy = _scale_boxes(xyxy, sx, sy)
-                    last_sv_dets = sv.Detections(
-                        xyxy       = xyxy,
-                        confidence = r.boxes.conf.cpu().numpy(),
-                        class_id   = r.boxes.cls.cpu().numpy().astype(int),
-                    )
-                else:
-                    last_sv_dets = sv.Detections.empty()
+            # ── Read latest detections (non-blocking) ──────────────────────────
+            with infer["lock"]:
+                last_sv_dets = infer["dets"]
 
             # ── ByteTrack every frame ─────────────────────────────────────────
             tracked     = tracker.update_with_detections(last_sv_dets)
@@ -478,6 +588,9 @@ def detection_loop(rtsp_url: str, labels: list, confidence: float,
             session["error"] = str(exc)
         print(f"[loop] ERROR: {exc}")
     finally:
+        infer["running"] = False
+        infer["event"].set()
+        infer_thread.join(timeout=5)
         cap.release()
         close_writers()
         with session_lock:
