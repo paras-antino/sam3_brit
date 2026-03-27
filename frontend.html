@@ -82,6 +82,21 @@
   }
   .hint { font-size: 0.65rem; color: #2a2a2a; margin-top: 3px; }
 
+  /* Cap mode section */
+  .cap-mode-section {
+    background: #0d0d10; border: 1px solid #2a2a3a; border-radius: 6px;
+    padding: 12px; display: flex; flex-direction: column; gap: 10px;
+  }
+  .cap-mode-header {
+    display: flex; align-items: center; gap: 8px; cursor: pointer;
+  }
+  .cap-mode-header input[type="checkbox"] { accent-color: #6495ed; width: 14px; height: 14px; cursor: pointer; }
+  .cap-mode-title { font-size: 0.7rem; color: #6495ed; text-transform: uppercase; letter-spacing: 1px; }
+  #cap-label-wrap { display: none; }
+  #cap-label-wrap.visible { display: block; }
+  #cap-label-input { border-color: #3a3a5a; }
+  #cap-label-input:focus { border-color: #6495ed; }
+
   .slider-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px; }
   .slider-val { color: #00c864; font-size: 0.82rem; }
   input[type="range"] { width: 100%; height: 4px; accent-color: #00c864; cursor: pointer; }
@@ -141,6 +156,19 @@
   }
   .meta-chip span { color: #e0e0e0; font-size: 0.88rem; }
 
+  /* Violation alert bar */
+  #violation-bar {
+    display: none; align-items: center; justify-content: space-between;
+    background: #1a0505; border: 1px solid #cc2222; border-radius: 6px;
+    padding: 10px 16px;
+  }
+  #violation-bar.active { display: flex; }
+  .viol-left { display: flex; align-items: center; gap: 10px; }
+  .viol-icon { font-size: 1.1rem; animation: pulse 0.9s infinite; }
+  .viol-text { font-size: 0.78rem; color: #ff5555; font-weight: bold; letter-spacing: 1px; }
+  .viol-sub  { font-size: 0.68rem; color: #883333; margin-top: 2px; }
+  .compliance-pct { font-size: 1.3rem; font-weight: bold; }
+
   .counts-row { display: flex; flex-wrap: wrap; gap: 10px; }
   .count-card {
     background: #111; border: 1px solid #1e1e1e; border-radius: 6px;
@@ -148,6 +176,23 @@
   }
   .count-card .clbl { font-size: 0.6rem; color: #444; text-transform: uppercase; letter-spacing: 1px; }
   .count-card .cval { font-size: 1.6rem; font-weight: bold; margin-top: 3px; }
+
+  /* Compliance cards */
+  .compliance-row { display: flex; gap: 10px; }
+  .comply-card {
+    flex: 1; border-radius: 6px; padding: 10px 16px; text-align: center;
+  }
+  .comply-card .clbl { font-size: 0.6rem; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 3px; }
+  .comply-card .cval { font-size: 1.6rem; font-weight: bold; }
+  .card-ok   { background: #0a180a; border: 1px solid #00c86444; }
+  .card-ok   .clbl { color: #2a6a2a; }
+  .card-ok   .cval { color: #00c864; }
+  .card-viol { background: #180a0a; border: 1px solid #cc222244; }
+  .card-viol .clbl { color: #6a2a2a; }
+  .card-viol .cval { color: #ff5555; }
+  .card-pct  { background: #111; border: 1px solid #2a2a2a; }
+  .card-pct  .clbl { color: #444; }
+  .card-pct  .cval { color: #e0e0e0; }
 
   /* Resource panel */
   .res-item { display: flex; flex-direction: column; gap: 6px; }
@@ -245,6 +290,19 @@
       <p class="hint">e.g. person · car · laptop · dog</p>
     </div>
 
+    <!-- Head Cap Compliance Mode -->
+    <div class="cap-mode-section">
+      <div class="cap-mode-header" onclick="toggleCapMode()">
+        <input type="checkbox" id="cap-mode-check"/>
+        <span class="cap-mode-title">Head Cap Compliance Mode</span>
+      </div>
+      <div id="cap-label-wrap">
+        <label style="color:#4a4a7a">Cap Label (must match a detection target above)</label>
+        <input type="text" id="cap-label-input" placeholder="e.g. transparent plastic head cap"/>
+        <p class="hint" style="color:#2a2a4a">Workers without a cap will be flagged in red</p>
+      </div>
+    </div>
+
     <div>
       <div class="slider-row">
         <label style="margin:0">Confidence</label>
@@ -260,7 +318,6 @@
     <button class="btn btn-stop"  id="btn-stop"  onclick="stopSession()">■ STOP SESSION</button>
     <button class="btn btn-save"  id="btn-save"  onclick="toggleSave()">⏺ START RECORDING</button>
 
-    <!-- Recording indicator -->
     <div class="save-indicator" id="save-indicator">
       <div class="rec-dot"></div>
       <span>Recording to disk...</span>
@@ -284,6 +341,34 @@
       <div class="meta-chip">FPS &nbsp;<span id="s-fps">—</span></div>
       <div class="meta-chip">Frames &nbsp;<span id="s-frames">—</span></div>
       <div class="meta-chip">Tracked &nbsp;<span id="s-tracked">—</span></div>
+    </div>
+
+    <!-- Violation alert bar (hidden when no violations) -->
+    <div id="violation-bar">
+      <div class="viol-left">
+        <span class="viol-icon">⚠</span>
+        <div>
+          <div class="viol-text" id="viol-text">0 workers without head cap</div>
+          <div class="viol-sub">Immediate corrective action required</div>
+        </div>
+      </div>
+      <div class="compliance-pct" id="compliance-pct" style="color:#ff5555">—</div>
+    </div>
+
+    <!-- Compliance summary (shown only in cap mode) -->
+    <div class="compliance-row" id="compliance-row" style="display:none">
+      <div class="comply-card card-ok">
+        <div class="clbl">With Cap</div>
+        <div class="cval" id="c-compliant">0</div>
+      </div>
+      <div class="comply-card card-viol">
+        <div class="clbl">No Cap</div>
+        <div class="cval" id="c-violations">0</div>
+      </div>
+      <div class="comply-card card-pct">
+        <div class="clbl">Compliance</div>
+        <div class="cval" id="c-pct">—</div>
+      </div>
     </div>
 
     <div class="counts-row" id="counts-row"></div>
@@ -398,25 +483,54 @@
     });
   }
 
+  // ── Cap mode toggle ────────────────────────────────────────────────────────
+  function toggleCapMode() {
+    const chk  = document.getElementById('cap-mode-check');
+    const wrap = document.getElementById('cap-label-wrap');
+    chk.checked = !chk.checked;
+    wrap.classList.toggle('visible', chk.checked);
+  }
+
+  function getCapLabel() {
+    const chk = document.getElementById('cap-mode-check');
+    if (!chk.checked) return '';
+    return document.getElementById('cap-label-input').value.trim().toLowerCase();
+  }
+
   // ── Session ────────────────────────────────────────────────────────────────
   async function startSession() {
-    const rtsp = document.getElementById('rtsp-url').value.trim();
-    const conf = parseFloat(document.getElementById('confidence').value);
+    const rtsp     = document.getElementById('rtsp-url').value.trim();
+    const conf     = parseFloat(document.getElementById('confidence').value);
+    const capLabel = getCapLabel();
+
     if (!rtsp)        { showError('Please enter an RTSP URL.'); return; }
     if (!tags.length) { showError('Add at least one detection target.'); return; }
+    if (capLabel && !tags.includes(capLabel)) {
+      showError(`Cap label "${capLabel}" must match one of your detection targets.`); return;
+    }
+
     hideError();
     setUIState('starting');
+
     try {
       const res  = await fetch('/session/start', {
         method: 'POST',
         headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({rtsp_url:rtsp, labels:tags, confidence:conf, every_n:5, save:false})
+        body: JSON.stringify({
+          rtsp_url:  rtsp,
+          labels:    tags,
+          confidence: conf,
+          every_n:   5,
+          save:      false,
+          cap_label: capLabel,
+        })
       });
       const data = await res.json();
       if (!res.ok) { showError(data.detail || 'Failed to start.'); setUIState('idle'); return; }
       setUIState('running');
       startPolling();
       showVideo();
+      if (capLabel) showComplianceUI(true);
     } catch(e) {
       showError('Could not reach server.');
       setUIState('idle');
@@ -432,6 +546,7 @@
       hideVideo();
       resetStats();
       setSaveUI(false);
+      showComplianceUI(false);
     }, 3500);
   }
 
@@ -463,6 +578,37 @@
     }
   }
 
+  // ── Compliance UI ──────────────────────────────────────────────────────────
+  function showComplianceUI(visible) {
+    document.getElementById('compliance-row').style.display = visible ? 'flex' : 'none';
+    if (!visible) {
+      document.getElementById('violation-bar').classList.remove('active');
+    }
+  }
+
+  function updateComplianceUI(violations, compliant, capActive) {
+    if (!capActive) return;
+    const total = violations + compliant;
+    const pct   = total > 0 ? Math.round((compliant / total) * 100) : 100;
+
+    document.getElementById('c-compliant').textContent  = compliant;
+    document.getElementById('c-violations').textContent = violations;
+    document.getElementById('c-pct').textContent        = pct + '%';
+    document.getElementById('c-pct').style.color        = pct >= 100 ? '#00c864' : pct >= 80 ? '#ffa500' : '#ff5555';
+
+    const bar = document.getElementById('violation-bar');
+    if (violations > 0) {
+      bar.classList.add('active');
+      document.getElementById('viol-text').textContent =
+        `${violations} worker${violations > 1 ? 's' : ''} without head cap`;
+      const pctEl = document.getElementById('compliance-pct');
+      pctEl.textContent = pct + '% compliant';
+      pctEl.style.color = pct >= 80 ? '#ffa500' : '#ff5555';
+    } else {
+      bar.classList.remove('active');
+    }
+  }
+
   // ── Polling ────────────────────────────────────────────────────────────────
   let pollTimer = null;
   const palette = ['#00c864','#ffa500','#6495ed','#cc44cc','#00c8c8','#c8c800','#ff5050','#50ff50'];
@@ -475,10 +621,12 @@
         document.getElementById('s-frames').textContent  = d.frame_idx;
         document.getElementById('s-tracked').textContent = Object.values(d.counts).reduce((a,b)=>a+b,0);
         updateCountCards(d.counts, d.labels || tags);
+        updateComplianceUI(d.violations || 0, d.compliant || 0, !!d.cap_label);
         if (d.saving !== isSaving) setSaveUI(d.saving);
         if (d.error) showError(d.error);
         if (!d.running && document.getElementById('btn-stop').style.display !== 'none') {
-          setUIState('idle'); stopPolling(); stopResourcePolling(); hideVideo(); setSaveUI(false);
+          setUIState('idle'); stopPolling(); stopResourcePolling(); hideVideo();
+          setSaveUI(false); showComplianceUI(false);
         }
       } catch(e) {}
     }, 1500);
@@ -570,6 +718,10 @@
     document.getElementById('s-frames').textContent  = '—';
     document.getElementById('s-tracked').textContent = '—';
     document.getElementById('counts-row').innerHTML  = '';
+    document.getElementById('c-compliant').textContent  = '0';
+    document.getElementById('c-violations').textContent = '0';
+    document.getElementById('c-pct').textContent        = '—';
+    document.getElementById('violation-bar').classList.remove('active');
   }
   function showError(msg) {
     const el = document.getElementById('error-msg');
@@ -627,6 +779,12 @@
         startPolling();
         showVideo();
         if (d.saving) setSaveUI(true);
+        if (d.cap_label) {
+          document.getElementById('cap-mode-check').checked = true;
+          document.getElementById('cap-label-input').value  = d.cap_label;
+          document.getElementById('cap-label-wrap').classList.add('visible');
+          showComplianceUI(true);
+        }
       }
     } catch(e) {}
   })();

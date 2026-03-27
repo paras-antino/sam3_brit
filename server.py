@@ -37,15 +37,15 @@ session = {
     "started_at": None,
     "saving":     False,
     "save_path":  None,
+    # cap compliance
+    "violations": 0,
+    "compliant":  0,
+    "cap_label":  "",
 }
 session_lock   = threading.Lock()
 session_thread = None
 
 # ── Global writer state ───────────────────────────────────────────────────────
-# These globals are ONLY ever assigned inside open_writers() / close_writers(),
-# never directly inside detection_loop — that was the "referenced before
-# assignment" bug (Python treats any name assigned anywhere in a function as
-# local for the whole function).
 writer      = None
 csv_file    = None
 csv_writer  = None
@@ -61,28 +61,34 @@ class StartRequest(BaseModel):
     confidence: float = 0.30
     every_n:    int   = 5
     save:       bool  = False
+    cap_label:  str   = ""   # if set, enables head-cap compliance mode
 
 
 class SaveRequest(BaseModel):
     save: bool
 
 
+# ── Cap compliance helpers ────────────────────────────────────────────────────
+
+def _boxes_overlap(box_a, box_b) -> bool:
+    """Return True if two (x1,y1,x2,y2) boxes overlap."""
+    return (box_a[0] < box_b[2] and box_a[2] > box_b[0] and
+            box_a[1] < box_b[3] and box_a[3] > box_b[1])
+
+
+def _person_has_cap(person_box, cap_boxes) -> bool:
+    """True if any cap box overlaps the top-40% (head) region of the person box."""
+    px1, py1, px2, py2 = person_box
+    head_region = (px1, py1, px2, py1 + 0.40 * (py2 - py1))
+    return any(_boxes_overlap(head_region, cb) for cb in cap_boxes)
+
+
 # ── Writer helpers ────────────────────────────────────────────────────────────
-#
-# Strategy:
-#   1. Record into a .mkv scratch file while streaming.
-#      MKV is a streamable container — it never needs a trailer/index written
-#      at the end, so a crash or pipe-break still leaves a playable file.
-#   2. On close, remux the .mkv → .mp4 with "-movflags +faststart" so the
-#      moov atom lands at the front of the file.  Without faststart, mp4
-#      puts the moov atom at the END and browsers cannot play the file until
-#      the entire download completes.
-#
-def open_writers(ts: str, labels_list: list, width: int, height: int, fps: float):
+def open_writers(ts: str, labels_list: list, width: int, height: int, fps: float,
+                 cap_mode: bool = False):
     """Start ffmpeg process + CSV file.  Must NOT be called while holding session_lock."""
     global writer, csv_file, csv_writer
 
-    # Write to MKV scratch — stream-safe, no moov-at-end problem
     scratch = os.path.join(OUTPUT_DIR, f"detection_{ts}.mkv")
     cpath   = os.path.join(OUTPUT_DIR, f"counts_{ts}.csv")
 
@@ -112,13 +118,15 @@ def open_writers(ts: str, labels_list: list, width: int, height: int, fps: float
 
         new_csv = open(cpath, "w", newline="")
         new_cw  = csv.writer(new_csv)
-        new_cw.writerow(["frame", "timestamp"] + labels_list + ["total_tracks", "fps"])
+        header  = ["frame", "timestamp"] + labels_list + ["total_tracks", "fps"]
+        if cap_mode:
+            header += ["violations", "compliant"]
+        new_cw.writerow(header)
 
         writer     = new_proc
         csv_file   = new_csv
         csv_writer = new_cw
 
-    # Expose the scratch path so the UI can show "recording…"
     with session_lock:
         session["save_path"] = scratch
 
@@ -127,31 +135,27 @@ def open_writers(ts: str, labels_list: list, width: int, height: int, fps: float
 
 
 def _remux_to_mp4(scratch: str) -> str:
-    """Remux MKV scratch file → browser-playable MP4 with moov atom at front.
-    Runs synchronously in a background thread after close_writers()."""
     mp4_path = scratch.replace(".mkv", ".mp4")
     cmd = [
         "ffmpeg", "-y",
         "-i",        scratch,
-        "-codec",    "copy",          # no re-encode — just rewrap
-        "-movflags", "+faststart",    # moov atom at front → browser can play immediately
+        "-codec",    "copy",
+        "-movflags", "+faststart",
         mp4_path,
     ]
     print(f"[remux] {scratch} → {mp4_path}")
     result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     if result.returncode == 0:
-        os.remove(scratch)            # delete scratch only on success
+        os.remove(scratch)
         print(f"[remux] done → {mp4_path}")
         return mp4_path
     else:
         err = result.stderr.decode(errors="replace")
         print(f"[remux] FAILED: {err}")
-        return scratch                # fall back to mkv if remux fails
+        return scratch
 
 
 def close_writers():
-    """Flush and close ffmpeg + CSV, then remux to browser-playable MP4.
-    Safe to call even if already closed."""
     global writer, csv_file, csv_writer
 
     scratch_path = None
@@ -161,8 +165,6 @@ def close_writers():
             try:
                 writer.stdin.close()
                 writer.wait()
-                # Capture the scratch path from stderr/argv isn't easy here,
-                # so we derive it from session (set in open_writers).
             except Exception as exc:
                 print(f"[ffmpeg] close error: {exc}")
             writer = None
@@ -176,19 +178,17 @@ def close_writers():
 
         csv_writer = None
 
-    # Grab the scratch path before clearing it
     with session_lock:
         scratch_path = session.get("save_path")
         session["save_path"] = None
 
     print("[writer] closed")
 
-    # Remux MKV → MP4 in a background thread so we don't block the detection loop
     if scratch_path and scratch_path.endswith(".mkv") and os.path.exists(scratch_path):
         threading.Thread(target=_remux_to_mp4, args=(scratch_path,), daemon=True).start()
 
 
-# ── Background cleanup (delete files older than 30 min) ──────────────────────
+# ── Background cleanup ────────────────────────────────────────────────────────
 def cleanup_loop():
     while True:
         try:
@@ -208,8 +208,10 @@ def cleanup_loop():
 
 # ── Detection loop ────────────────────────────────────────────────────────────
 def detection_loop(rtsp_url: str, labels: list, confidence: float,
-                   every_n: int, save_on_start: bool):
+                   every_n: int, save_on_start: bool, cap_label: str = ""):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    cap_mode = bool(cap_label)
 
     # ── Load model ────────────────────────────────────────────────────────────
     print("[sam3] loading model...")
@@ -226,6 +228,27 @@ def detection_loop(rtsp_url: str, labels: list, confidence: float,
     box_ann   = sv.BoxAnnotator(thickness=2)
     lbl_ann   = sv.LabelAnnotator(text_scale=0.5, text_thickness=1)
     trace_ann = sv.TraceAnnotator(thickness=2, trace_length=40)
+
+    # Compliance-specific annotators (only used when cap_mode is True)
+    if cap_mode:
+        viol_box_ann = sv.BoxAnnotator(
+            thickness=3,
+            color=sv.ColorPalette.from_hex(["#FF3333"]),
+        )
+        viol_lbl_ann = sv.LabelAnnotator(
+            text_scale=0.55, text_thickness=2,
+            color=sv.ColorPalette.from_hex(["#FF3333"]),
+            text_color=sv.Color.WHITE,
+        )
+        ok_box_ann = sv.BoxAnnotator(
+            thickness=3,
+            color=sv.ColorPalette.from_hex(["#00C864"]),
+        )
+        ok_lbl_ann = sv.LabelAnnotator(
+            text_scale=0.55, text_thickness=2,
+            color=sv.ColorPalette.from_hex(["#00C864"]),
+            text_color=sv.Color.BLACK,
+        )
 
     # ── Open RTSP ─────────────────────────────────────────────────────────────
     print(f"[rtsp] connecting -> {rtsp_url}")
@@ -246,9 +269,9 @@ def detection_loop(rtsp_url: str, labels: list, confidence: float,
     # ── Open writers if requested at start ────────────────────────────────────
     if save_on_start:
         open_writers(datetime.now().strftime("%Y%m%d_%H%M%S"),
-                     labels, width, height, stream_fps)
+                     labels, width, height, stream_fps, cap_mode)
         with session_lock:
-            session["saving"] = True   # keep flag in sync
+            session["saving"] = True
 
     # ── Loop state ────────────────────────────────────────────────────────────
     frame_idx    = 0
@@ -273,13 +296,12 @@ def detection_loop(rtsp_url: str, labels: list, confidence: float,
                 print("[loop] stop signal received")
                 break
 
-            # Read writer state under lock — no direct global access in this function
             with writer_lock:
                 writer_active = writer is not None
 
             if should_save and not writer_active:
                 open_writers(datetime.now().strftime("%Y%m%d_%H%M%S"),
-                             labels, width, height, stream_fps)
+                             labels, width, height, stream_fps, cap_mode)
             elif not should_save and writer_active:
                 close_writers()
 
@@ -342,6 +364,62 @@ def detection_loop(rtsp_url: str, labels: list, confidence: float,
             if label_texts:
                 annotated = lbl_ann.annotate(annotated, tracked, labels=label_texts)
 
+            # ── Cap compliance overlay ────────────────────────────────────────
+            violations = 0
+            compliant  = 0
+
+            if cap_mode and tracked.xyxy is not None and len(tracked.xyxy) > 0:
+                n        = len(tracked.xyxy)
+                cls_arr  = tracked.class_id   if tracked.class_id   is not None else np.zeros(n, int)
+                tid_arr  = tracked.tracker_id if tracked.tracker_id is not None else np.arange(n)
+                conf_arr = tracked.confidence if tracked.confidence is not None else np.ones(n)
+
+                person_cls = {i for i, l in enumerate(labels) if l == "person"}
+                cap_cls    = {i for i, l in enumerate(labels) if l == cap_label}
+
+                cap_boxes = [tracked.xyxy[i] for i in range(n) if cls_arr[i] in cap_cls]
+
+                viol_idx   = [i for i in range(n)
+                              if cls_arr[i] in person_cls
+                              and not _person_has_cap(tracked.xyxy[i], cap_boxes)]
+                comply_idx = [i for i in range(n)
+                              if cls_arr[i] in person_cls
+                              and _person_has_cap(tracked.xyxy[i], cap_boxes)]
+
+                violations = len(viol_idx)
+                compliant  = len(comply_idx)
+
+                def _make_dets(idx_list):
+                    idx = np.array(idx_list)
+                    return sv.Detections(
+                        xyxy=tracked.xyxy[idx],
+                        confidence=conf_arr[idx],
+                        class_id=cls_arr[idx],
+                        tracker_id=tid_arr[idx],
+                    )
+
+                if viol_idx:
+                    vd = _make_dets(viol_idx)
+                    vl = [f"#{tid_arr[i]} NO CAP" for i in viol_idx]
+                    annotated = viol_box_ann.annotate(annotated, vd)
+                    annotated = viol_lbl_ann.annotate(annotated, vd, labels=vl)
+
+                if comply_idx:
+                    cd = _make_dets(comply_idx)
+                    cl_labels = [f"#{tid_arr[i]} CAP OK" for i in comply_idx]
+                    annotated = ok_box_ann.annotate(annotated, cd)
+                    annotated = ok_lbl_ann.annotate(annotated, cd, labels=cl_labels)
+
+                # Violation flash banner at top of frame
+                if violations > 0:
+                    banner_h = 36
+                    overlay  = annotated.copy()
+                    cv2.rectangle(overlay, (0, 0), (width, banner_h), (0, 0, 180), -1)
+                    cv2.addWeighted(overlay, 0.65, annotated, 0.35, 0, annotated)
+                    msg = f"  VIOLATION: {violations} worker(s) without head cap"
+                    cv2.putText(annotated, msg, (8, 24),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+
             # ── Timing ────────────────────────────────────────────────────────
             now         = time.time()
             fps_display = 1.0 / max(now - t_frame, 1e-6)
@@ -350,10 +428,12 @@ def detection_loop(rtsp_url: str, labels: list, confidence: float,
 
             # ── Push annotated frame to browser stream ────────────────────────
             with session_lock:
-                session["frame"]     = annotated.copy()
-                session["counts"]    = dict(counts)
-                session["fps"]       = fps_display
-                session["frame_idx"] = frame_idx
+                session["frame"]      = annotated.copy()
+                session["counts"]     = dict(counts)
+                session["fps"]        = fps_display
+                session["frame_idx"]  = frame_idx
+                session["violations"] = violations
+                session["compliant"]  = compliant
 
             # ── Write to disk ─────────────────────────────────────────────────
             with session_lock:
@@ -379,10 +459,14 @@ def detection_loop(rtsp_url: str, labels: list, confidence: float,
                 row  = [frame_idx, round(elapsed, 2)]
                 row += [counts.get(lbl, 0) for lbl in labels]
                 row += [len(tracked), round(fps_display, 2)]
+                if cap_mode:
+                    row += [violations, compliant]
                 current_cw.writerow(row)
 
             if frame_idx % 30 == 0:
-                print(f"[loop] frame={frame_idx:05d} fps={fps_display:.1f} counts={dict(counts)}")
+                print(f"[loop] frame={frame_idx:05d} fps={fps_display:.1f} "
+                      f"counts={dict(counts)}"
+                      + (f" violations={violations} compliant={compliant}" if cap_mode else ""))
 
             frame_idx += 1
 
@@ -409,25 +493,38 @@ def start_session(req: StartRequest):
             raise HTTPException(409, "Session already running. Stop it first.")
         if not req.labels:
             raise HTTPException(400, "Provide at least one label.")
+
+        # In cap-compliance mode, ensure "person" is in labels so SAM3 detects people
+        labels = list(req.labels)
+        if req.cap_label:
+            if req.cap_label not in labels:
+                raise HTTPException(400, f"cap_label '{req.cap_label}' must be in labels list.")
+            if "person" not in labels:
+                labels.insert(0, "person")
+
         session.update({
-            "labels":    req.labels,
-            "rtsp_url":  req.rtsp_url,
-            "frame":     None,
-            "counts":    {},
-            "fps":       0.0,
-            "frame_idx": 0,
-            "error":     None,
-            "saving":    req.save,
-            "save_path": None,
+            "labels":     labels,
+            "rtsp_url":   req.rtsp_url,
+            "frame":      None,
+            "counts":     {},
+            "fps":        0.0,
+            "frame_idx":  0,
+            "error":      None,
+            "saving":     req.save,
+            "save_path":  None,
+            "violations": 0,
+            "compliant":  0,
+            "cap_label":  req.cap_label,
         })
 
     session_thread = threading.Thread(
         target=detection_loop,
-        args=(req.rtsp_url, req.labels, req.confidence, req.every_n, req.save),
+        args=(req.rtsp_url, labels, req.confidence, req.every_n, req.save, req.cap_label),
         daemon=True,
     )
     session_thread.start()
-    return {"status": "started", "labels": req.labels, "rtsp_url": req.rtsp_url}
+    return {"status": "started", "labels": labels, "rtsp_url": req.rtsp_url,
+            "cap_mode": bool(req.cap_label)}
 
 
 @app.post("/session/stop")
@@ -441,10 +538,12 @@ def stop_session():
     def _clear_after_delay():
         time.sleep(4)
         with session_lock:
-            session["frame"]     = None
-            session["counts"]    = {}
-            session["fps"]       = 0.0
-            session["frame_idx"] = 0
+            session["frame"]      = None
+            session["counts"]     = {}
+            session["fps"]        = 0.0
+            session["frame_idx"]  = 0
+            session["violations"] = 0
+            session["compliant"]  = 0
 
     threading.Thread(target=_clear_after_delay, daemon=True).start()
     return {"status": "stopping"}
@@ -473,6 +572,9 @@ def session_status():
             "error":      session["error"],
             "saving":     session["saving"],
             "save_path":  session["save_path"],
+            "violations": session["violations"],
+            "compliant":  session["compliant"],
+            "cap_label":  session["cap_label"],
         })
 
 
@@ -493,11 +595,11 @@ def list_recordings():
     return JSONResponse(files)
 
 
-CHUNK_SIZE = 1024 * 256  # 256 KB per read — fast seek, low memory
+CHUNK_SIZE = 1024 * 256  # 256 KB
 
 @app.api_route("/recordings/{filename}", methods=["GET", "HEAD"])
 async def stream_recording(filename: str, request: Request):
-    filename = os.path.basename(filename)   # prevent path traversal
+    filename = os.path.basename(filename)
     fpath    = os.path.join(OUTPUT_DIR, filename)
     if not os.path.exists(fpath):
         raise HTTPException(404, "File not found")
@@ -506,7 +608,6 @@ async def stream_recording(filename: str, request: Request):
     range_header = request.headers.get("range")
     mime_type    = "video/mp4" if filename.endswith(".mp4") else "video/x-matroska"
 
-    # HEAD — browser uses this to discover file size and range support
     if request.method == "HEAD":
         return Response(
             status_code=200,
@@ -518,13 +619,10 @@ async def stream_recording(filename: str, request: Request):
             },
         )
 
-    # Range request — browsers ALWAYS use this for <video> seek/play
     if range_header:
         range_val = range_header.strip().lower().replace("bytes=", "")
         parts     = range_val.split("-")
         start     = int(parts[0]) if parts[0] else 0
-        # If end is omitted (e.g. "bytes=0-"), serve up to 2 MB so the
-        # browser gets the moov atom quickly without reading the whole file.
         if len(parts) > 1 and parts[1]:
             end = int(parts[1])
         else:
@@ -555,7 +653,6 @@ async def stream_recording(filename: str, request: Request):
             },
         )
 
-    # No Range header — stream the whole file in chunks
     def _iter_full():
         with open(fpath, "rb") as f:
             while True:
@@ -589,7 +686,7 @@ def video_feed():
             _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
             yield (b"--frame\r\n"
                    b"Content-Type: image/jpeg\r\n\r\n" + buf.tobytes() + b"\r\n")
-            time.sleep(0.033)   # ~30 fps cap for the browser stream
+            time.sleep(0.033)
 
     return StreamingResponse(_generate(),
                              media_type="multipart/x-mixed-replace; boundary=frame")
