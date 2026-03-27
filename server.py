@@ -293,21 +293,19 @@ def _scale_boxes(xyxy: np.ndarray, sx: float, sy: float) -> np.ndarray:
 
 
 # ── Pre-inference quality enhancement ────────────────────────────────────────
-# Applied to every tile before SAM3 sees it.
-# 1. CLAHE on the LAB L-channel — lifts local contrast so faint cap/glove
-#    boundaries become visible without blowing out highlights elsewhere.
-# 2. Unsharp mask — sharpens edges so small distant objects have crisp borders.
+# CLAHE on the LAB L-channel only — lifts local contrast so faint cap/glove
+# boundaries become visible in low-contrast or distant scenes.
+# Unsharp masking is intentionally omitted: it adds ringing artifacts around
+# edges that break SAM3's text-to-visual matching for surgical caps and gloves.
 
-_CLAHE = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(16, 16))
+_CLAHE = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 
 
 def _enhance(img: np.ndarray) -> np.ndarray:
     lab     = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
     l       = _CLAHE.apply(l)
-    out     = cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
-    blur    = cv2.GaussianBlur(out, (0, 0), sigmaX=2.0)
-    return cv2.addWeighted(out, 1.6, blur, -0.6, 0)
+    return cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
 
 
 # ── SAHI: tiled inference ─────────────────────────────────────────────────────
@@ -367,6 +365,50 @@ def _run_sahi(frame: np.ndarray, predictor, labels: list,
     return merged.with_nms(threshold=0.45)
 
 
+def _infer_full_frame(frame: np.ndarray, predictor,
+                      labels: list) -> sv.Detections:
+    """
+    Single SAM3 inference on the entire frame (enhanced but not tiled).
+    Catches objects that SAHI misses because they straddle tile boundaries —
+    e.g. gloves on hands near the edge of a tile, or a surgical cap whose
+    top is cropped off in one tile and bottom in the next.
+    """
+    pil = PILImage.fromarray(
+        cv2.cvtColor(_enhance(frame), cv2.COLOR_BGR2RGB))
+    try:
+        predictor.set_image(pil)
+        results = predictor(text=labels)
+    except Exception as exc:
+        print(f"[full] error: {exc}")
+        return sv.Detections.empty()
+    if results and results[0].boxes is not None:
+        r = results[0]
+        return sv.Detections(
+            xyxy=r.boxes.xyxy.cpu().numpy().copy(),
+            confidence=r.boxes.conf.cpu().numpy(),
+            class_id=r.boxes.cls.cpu().numpy().astype(int),
+        )
+    return sv.Detections.empty()
+
+
+def _merge(*dets_list) -> sv.Detections:
+    """Merge any number of sv.Detections and deduplicate with NMS."""
+    boxes, confs, cls = [], [], []
+    for d in dets_list:
+        if d is not None and len(d) > 0:
+            boxes.append(d.xyxy)
+            confs.append(d.confidence)
+            cls.append(d.class_id)
+    if not boxes:
+        return sv.Detections.empty()
+    merged = sv.Detections(
+        xyxy=np.vstack(boxes),
+        confidence=np.hstack(confs),
+        class_id=np.hstack(cls),
+    )
+    return merged.with_nms(threshold=0.45)
+
+
 # ── Detection loop ────────────────────────────────────────────────────────────
 def detection_loop(rtsp_url: str, labels: list, confidence: float,
                    every_n: int, save_on_start: bool):
@@ -420,60 +462,12 @@ def detection_loop(rtsp_url: str, labels: list, confidence: float,
         with session_lock:
             session["saving"] = True   # keep flag in sync
 
-    # ── Async inference thread ─────────────────────────────────────────────────
-    # SAHI + SR can take 500-1500 ms per cycle.  Running inference in a
-    # background thread keeps the annotation loop smooth at full stream FPS
-    # while ByteTrack always has the latest available detections.
-    infer = {
-        "running": True,
-        "frame":   None,
-        "dets":    sv.Detections.empty(),
-        "lock":    threading.Lock(),
-        "event":   threading.Event(),
-    }
-
-    def _inference_worker():
-        while infer["running"]:
-            infer["event"].wait(timeout=1.0)
-            infer["event"].clear()
-            if not infer["running"]:
-                break
-            with infer["lock"]:
-                f = infer["frame"]
-            if f is None:
-                continue
-            t0 = time.time()
-            try:
-                # Optional SR upscale before SAHI
-                if upsampler is not None:
-                    f_sr   = _apply_sr(f, upsampler, outscale=sr_outscale)
-                    sr_h, sr_w = f_sr.shape[:2]
-                    sx = f.shape[1] / sr_w
-                    sy = f.shape[0] / sr_h
-                    dets = _run_sahi(f_sr, predictor, labels, n_cols, n_rows)
-                    if len(dets) > 0:
-                        dets = sv.Detections(
-                            xyxy=_scale_boxes(dets.xyxy, sx, sy),
-                            confidence=dets.confidence,
-                            class_id=dets.class_id,
-                        )
-                else:
-                    dets = _run_sahi(f, predictor, labels, n_cols, n_rows)
-                print(f"[infer] {len(dets)} dets  {(time.time()-t0)*1000:.0f} ms")
-            except Exception as exc:
-                print(f"[infer] error: {exc}")
-                dets = sv.Detections.empty()
-            with infer["lock"]:
-                infer["dets"] = dets
-
-    infer_thread = threading.Thread(target=_inference_worker, daemon=True)
-    infer_thread.start()
-
     # ── Loop state ────────────────────────────────────────────────────────────
-    frame_idx   = 0
-    t_start     = time.time()
-    t_frame     = t_start
-    fps_display = 0.0
+    frame_idx    = 0
+    t_start      = time.time()
+    t_frame      = t_start
+    fps_display  = 0.0
+    last_sv_dets = sv.Detections.empty()
 
     with session_lock:
         session["running"]    = True
@@ -522,15 +516,34 @@ def detection_loop(rtsp_url: str, labels: list, confidence: float,
             if MAX_FRAMES and frame_idx >= MAX_FRAMES:
                 break
 
-            # ── Trigger async inference every N frames ─────────────────────────
+            # ── Inference every N frames (synchronous — latency is acceptable) ─
+            # Two complementary passes are merged for maximum recall:
+            #   1. SAHI on the SR frame  — best for small/distant objects
+            #   2. Full-frame on original — catches objects split by tile edges
+            #      (surgical caps cut at top of tile, gloves at the sides, etc.)
             if frame_idx % every_n == 0:
-                with infer["lock"]:
-                    infer["frame"] = frame.copy()
-                infer["event"].set()
+                t0 = time.time()
+                try:
+                    if upsampler is not None:
+                        f_sr = _apply_sr(frame, upsampler, outscale=sr_outscale)
+                        sx   = frame.shape[1] / f_sr.shape[1]
+                        sy   = frame.shape[0] / f_sr.shape[0]
+                        sahi_dets = _run_sahi(f_sr, predictor, labels, n_cols, n_rows)
+                        if len(sahi_dets) > 0:
+                            sahi_dets = sv.Detections(
+                                xyxy=_scale_boxes(sahi_dets.xyxy, sx, sy),
+                                confidence=sahi_dets.confidence,
+                                class_id=sahi_dets.class_id,
+                            )
+                    else:
+                        sahi_dets = _run_sahi(frame, predictor, labels, n_cols, n_rows)
 
-            # ── Read latest detections (non-blocking) ──────────────────────────
-            with infer["lock"]:
-                last_sv_dets = infer["dets"]
+                    full_dets    = _infer_full_frame(frame, predictor, labels)
+                    last_sv_dets = _merge(sahi_dets, full_dets)
+                    print(f"[infer] sahi={len(sahi_dets)} full={len(full_dets)} "
+                          f"merged={len(last_sv_dets)}  {(time.time()-t0)*1000:.0f} ms")
+                except Exception as exc:
+                    print(f"[infer] error: {exc}")
 
             # ── ByteTrack every frame ─────────────────────────────────────────
             tracked     = tracker.update_with_detections(last_sv_dets)
@@ -602,9 +615,6 @@ def detection_loop(rtsp_url: str, labels: list, confidence: float,
             session["error"] = str(exc)
         print(f"[loop] ERROR: {exc}")
     finally:
-        infer["running"] = False
-        infer["event"].set()
-        infer_thread.join(timeout=5)
         cap.release()
         close_writers()
         with session_lock:
