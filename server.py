@@ -408,6 +408,7 @@ def _run_head_crops(frame: np.ndarray, dets: sv.Detections,
         return result
     if cap_yolo is None and crop_predictor is None:
         return result
+    # Both models run when available; cap detected if either says yes.
 
     person_cls_ids = {i for i, l in enumerate(labels) if l == "person"}
 
@@ -431,17 +432,18 @@ def _run_head_crops(frame: np.ndarray, dets: sv.Detections,
             if crop_w >= 10 and crop_h >= 10:
                 head_crop = _enhance(frame[cy1:cy2, cx1:cx2])
                 try:
+                    # ── YOLOWorld on the head crop ────────────────────────────
+                    yw_hit = False
                     if cap_yolo is not None:
-                        # ── Primary: YOLOWorld on the head crop ───────────────
-                        # Low conf=0.10 because the crop is already tight and
-                        # we'd rather have a false positive (cap seen) than miss
-                        # a hair net — downstream compliance logic flags violations,
-                        # so false-positives are less harmful than missed caps.
                         res = cap_yolo(head_crop, verbose=False, conf=0.10)
-                        has_cap = bool(res and res[0].boxes is not None
-                                       and len(res[0].boxes) > 0)
-                    else:
-                        # ── Fallback: SAM3 box-prompted ───────────────────────
+                        yw_hit = bool(res and res[0].boxes is not None
+                                      and len(res[0].boxes) > 0)
+
+                    # ── SAM3 on the head crop ─────────────────────────────────
+                    sam_hit = False
+                    if crop_predictor is not None and not yw_hit:
+                        # Only run SAM3 when YOLOWorld missed — saves time when
+                        # YOLOWorld already found the cap.
                         head_crop_pil = PILImage.fromarray(
                             cv2.cvtColor(head_crop, cv2.COLOR_BGR2RGB))
                         crop_predictor.set_image(head_crop_pil)
@@ -452,13 +454,15 @@ def _run_head_crops(frame: np.ndarray, dets: sv.Detections,
                             )
                         except TypeError:
                             crop_res = crop_predictor(text=[cap_label])
-                        has_cap = bool(crop_res and crop_res[0].boxes is not None
+                        sam_hit = bool(crop_res and crop_res[0].boxes is not None
                                        and len(crop_res[0].boxes) > 0)
+
+                    has_cap = yw_hit or sam_hit
+                    print(f"[crop] h={person_h}px  yw={yw_hit}  sam={sam_hit}  cap={has_cap}")
                 except Exception as exc:
                     print(f"[crop] error: {exc}")
 
             result.append((_box_center(box), has_cap, True))
-            print(f"[crop] close h={person_h}px  has_cap={has_cap}")
         else:
             result.append((_box_center(box), None, False))
 
@@ -599,29 +603,32 @@ def detection_loop(rtsp_url: str, labels: list, confidence: float,
     cap_yolo = None
     crop_predictor = None
     if cap_mode:
-        # YOLOWorld: primary cap/hair-net detector
+        # ── YOLOWorld (optional, loaded if available) ──────────────────────────
+        # Open-vocabulary detection; tries all CAP_SYNONYMS simultaneously.
+        # Loaded alongside SAM3 (not instead of it) so both run and either
+        # finding a cap counts as detected.
         try:
             from ultralytics import YOLOWorld
             print(f"[yoloworld] loading {YOLO_WORLD_MODEL} for cap detection…")
             cap_yolo = YOLOWorld(YOLO_WORLD_MODEL)
-            # Combine user cap_label with common synonyms for maximum recall
             classes = list(dict.fromkeys([cap_label] + CAP_SYNONYMS))
             cap_yolo.set_classes(classes)
-            cap_yolo(_dummy, verbose=False)   # warm up
+            cap_yolo(_dummy, verbose=False)
             print(f"[yoloworld] ready  classes={classes}")
         except Exception as exc:
-            print(f"[yoloworld] unavailable ({exc}) — falling back to SAM3 for cap detection")
+            print(f"[yoloworld] unavailable ({exc})")
             cap_yolo = None
 
-        if cap_yolo is None:
-            # SAM3 fallback for cap detection
-            crop_conf = max(confidence * 0.65, 0.15)
-            print(f"[sam3] loading head-crop predictor (imgsz=512, conf={crop_conf:.2f})…")
-            crop_predictor = SAM3SemanticPredictor(overrides=dict(
-                conf=crop_conf, task="segment", mode="predict",
-                model=MODEL_PATH, half=True, imgsz=512, verbose=False,
-            ))
-            print("[sam3] cap predictor ready")
+        # ── SAM3 cap predictor (always loaded in cap mode) ─────────────────────
+        # Kept regardless of whether YOLOWorld loaded — the two models run in
+        # parallel and cap = YOLOWorld-hit OR SAM3-hit, maximising recall.
+        crop_conf = max(confidence * 0.50, 0.12)
+        print(f"[sam3] loading head-crop predictor (imgsz=512, conf={crop_conf:.2f})…")
+        crop_predictor = SAM3SemanticPredictor(overrides=dict(
+            conf=crop_conf, task="segment", mode="predict",
+            model=MODEL_PATH, half=True, imgsz=512, verbose=False,
+        ))
+        print("[sam3] cap predictor ready")
 
     # ── Real-ESRGAN (optional) ─────────────────────────────────────────────────
     # Load once here so the weight file is downloaded before the stream starts.
