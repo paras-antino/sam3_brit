@@ -4,7 +4,7 @@ import psutil
 import subprocess
 import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import datetime
 from typing import List
 
@@ -23,6 +23,10 @@ from ultralytics.models.sam import SAM3SemanticPredictor
 MODEL_PATH = "/home/paras/sam3/sam3.pt"
 OUTPUT_DIR = "/home/paras/sam3/outputs"
 MAX_FRAMES = None   # set to an int to cap frames per session
+
+# Stream is delayed by this many seconds so inference results are ready before
+# the frame appears on screen.  Raise if inference is still lagging.
+STREAM_DELAY_S = 3.0
 
 # ── Session state ─────────────────────────────────────────────────────────────
 session = {
@@ -462,6 +466,71 @@ def detection_loop(rtsp_url: str, labels: list, confidence: float,
         with session_lock:
             session["saving"] = True   # keep flag in sync
 
+    # ── Delay buffer + inference thread ───────────────────────────────────────
+    # Strategy: buffer every frame for STREAM_DELAY_S seconds.  The inference
+    # thread processes frames as they arrive and stores results keyed by frame
+    # index.  The display loop always shows the frame from STREAM_DELAY_S ago,
+    # by which time its inference results are ready — giving accurate detections
+    # with zero async mismatch, at the cost of a visible 3-second delay.
+
+    display_buf    = deque()   # (timestamp, frame_idx, raw_frame)
+    det_store      = {}        # frame_idx → sv.Detections
+    det_store_lock = threading.Lock()
+
+    infer = {
+        "running":   True,
+        "frame_idx": 0,
+        "frame":     None,
+        "lock":      threading.Lock(),
+        "event":     threading.Event(),
+    }
+
+    def _inference_worker():
+        while infer["running"]:
+            infer["event"].wait(timeout=1.0)
+            infer["event"].clear()
+            if not infer["running"]:
+                break
+            with infer["lock"]:
+                fid = infer["frame_idx"]
+                f   = infer["frame"]
+            if f is None:
+                continue
+            t0 = time.time()
+            try:
+                if upsampler is not None:
+                    f_sr = _apply_sr(f, upsampler, outscale=sr_outscale)
+                    sx   = f.shape[1] / f_sr.shape[1]
+                    sy   = f.shape[0] / f_sr.shape[0]
+                    sahi_dets = _run_sahi(f_sr, predictor, labels, n_cols, n_rows)
+                    if len(sahi_dets) > 0:
+                        sahi_dets = sv.Detections(
+                            xyxy=_scale_boxes(sahi_dets.xyxy, sx, sy),
+                            confidence=sahi_dets.confidence,
+                            class_id=sahi_dets.class_id,
+                        )
+                else:
+                    sahi_dets = _run_sahi(f, predictor, labels, n_cols, n_rows)
+
+                full_dets = _infer_full_frame(f, predictor, labels)
+                dets = _merge(sahi_dets, full_dets)
+                print(f"[infer] fid={fid} sahi={len(sahi_dets)} "
+                      f"full={len(full_dets)} merged={len(dets)} "
+                      f"{(time.time()-t0)*1000:.0f} ms")
+            except Exception as exc:
+                print(f"[infer] error: {exc}")
+                dets = sv.Detections.empty()
+
+            with det_store_lock:
+                det_store[fid] = dets
+                # Keep only recent entries to avoid unbounded memory growth
+                cutoff = fid - int(stream_fps * (STREAM_DELAY_S + 5))
+                for k in [k for k in det_store if k < cutoff]:
+                    del det_store[k]
+
+    infer_thread = threading.Thread(target=_inference_worker, daemon=True)
+    infer_thread.start()
+
     # ── Loop state ────────────────────────────────────────────────────────────
     frame_idx    = 0
     t_start      = time.time()
@@ -469,10 +538,17 @@ def detection_loop(rtsp_url: str, labels: list, confidence: float,
     fps_display  = 0.0
     last_sv_dets = sv.Detections.empty()
 
+    # Build a "buffering" placeholder shown during the initial delay window
+    buf_frame = np.zeros((height, width, 3), dtype=np.uint8)
+    cv2.putText(buf_frame, "Buffering — please wait...",
+                (width // 2 - 220, height // 2),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (200, 200, 200), 2)
+
     with session_lock:
         session["running"]    = True
         session["started_at"] = datetime.now().isoformat()
         session["error"]      = None
+        session["frame"]      = buf_frame.copy()
 
     try:
         while True:
@@ -516,34 +592,37 @@ def detection_loop(rtsp_url: str, labels: list, confidence: float,
             if MAX_FRAMES and frame_idx >= MAX_FRAMES:
                 break
 
-            # ── Inference every N frames (synchronous — latency is acceptable) ─
-            # Two complementary passes are merged for maximum recall:
-            #   1. SAHI on the SR frame  — best for small/distant objects
-            #   2. Full-frame on original — catches objects split by tile edges
-            #      (surgical caps cut at top of tile, gloves at the sides, etc.)
-            if frame_idx % every_n == 0:
-                t0 = time.time()
-                try:
-                    if upsampler is not None:
-                        f_sr = _apply_sr(frame, upsampler, outscale=sr_outscale)
-                        sx   = frame.shape[1] / f_sr.shape[1]
-                        sy   = frame.shape[0] / f_sr.shape[0]
-                        sahi_dets = _run_sahi(f_sr, predictor, labels, n_cols, n_rows)
-                        if len(sahi_dets) > 0:
-                            sahi_dets = sv.Detections(
-                                xyxy=_scale_boxes(sahi_dets.xyxy, sx, sy),
-                                confidence=sahi_dets.confidence,
-                                class_id=sahi_dets.class_id,
-                            )
-                    else:
-                        sahi_dets = _run_sahi(frame, predictor, labels, n_cols, n_rows)
+            # ── Buffer current frame ───────────────────────────────────────────
+            display_buf.append((time.time(), frame_idx, frame.copy()))
 
-                    full_dets    = _infer_full_frame(frame, predictor, labels)
-                    last_sv_dets = _merge(sahi_dets, full_dets)
-                    print(f"[infer] sahi={len(sahi_dets)} full={len(full_dets)} "
-                          f"merged={len(last_sv_dets)}  {(time.time()-t0)*1000:.0f} ms")
-                except Exception as exc:
-                    print(f"[infer] error: {exc}")
+            # ── Trigger inference for this frame ───────────────────────────────
+            if frame_idx % every_n == 0:
+                with infer["lock"]:
+                    infer["frame_idx"] = frame_idx
+                    infer["frame"]     = frame.copy()
+                infer["event"].set()
+
+            # ── Pull the delayed display frame ────────────────────────────────
+            # Consume all buffer entries older than STREAM_DELAY_S, keep the
+            # most recent one as the frame to display this iteration.
+            now = time.time()
+            display_frame = None
+            display_fid   = None
+            while display_buf and (now - display_buf[0][0]) >= STREAM_DELAY_S:
+                _, fid_d, f_d = display_buf.popleft()
+                display_frame = f_d
+                display_fid   = fid_d
+
+            if display_frame is None:
+                # Buffer still filling — keep showing the placeholder
+                frame_idx += 1
+                continue
+
+            # ── Match best inference result to the display frame ───────────────
+            with det_store_lock:
+                candidates = [k for k in det_store if k <= display_fid]
+                if candidates:
+                    last_sv_dets = det_store[max(candidates)]
 
             # ── ByteTrack every frame ─────────────────────────────────────────
             tracked     = tracker.update_with_detections(last_sv_dets)
@@ -560,7 +639,7 @@ def detection_loop(rtsp_url: str, labels: list, confidence: float,
                 label_texts.append(f"#{tid} {name} {conf:.2f}")
 
             # ── Annotate ──────────────────────────────────────────────────────
-            annotated = frame.copy()
+            annotated = display_frame.copy()
             annotated = trace_ann.annotate(annotated, tracked)
             annotated = box_ann.annotate(annotated, tracked)
             if label_texts:
@@ -600,7 +679,7 @@ def detection_loop(rtsp_url: str, labels: list, confidence: float,
                 print(f"[debug] saving=True but writer is None at frame={frame_idx}")
 
             if current_cw is not None:
-                row  = [frame_idx, round(elapsed, 2)]
+                row  = [display_fid, round(elapsed, 2)]
                 row += [counts.get(lbl, 0) for lbl in labels]
                 row += [len(tracked), round(fps_display, 2)]
                 current_cw.writerow(row)
@@ -615,6 +694,9 @@ def detection_loop(rtsp_url: str, labels: list, confidence: float,
             session["error"] = str(exc)
         print(f"[loop] ERROR: {exc}")
     finally:
+        infer["running"] = False
+        infer["event"].set()
+        infer_thread.join(timeout=5)
         cap.release()
         close_writers()
         with session_lock:
