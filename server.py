@@ -4,9 +4,10 @@ import psutil
 import subprocess
 import threading
 import time
+import uuid
 from collections import defaultdict, deque
 from datetime import datetime
-from typing import List
+from typing import List, Optional
 
 import cv2
 import numpy as np
@@ -28,65 +29,100 @@ MAX_FRAMES = None   # set to an int to cap frames per session
 # the frame appears on screen.  Raise if inference is still lagging.
 STREAM_DELAY_S = 3.0
 
-# ── Session state ─────────────────────────────────────────────────────────────
-session = {
-    "running":    False,
-    "frame":      None,
-    "counts":     {},
-    "fps":        0.0,
-    "frame_idx":  0,
-    "error":      None,
-    "labels":     [],
-    "rtsp_url":   None,
-    "started_at": None,
-    "saving":     False,
-    "save_path":  None,
-}
-session_lock   = threading.Lock()
-session_thread = None
+# ── Multi-session state ───────────────────────────────────────────────────────
+# sessions maps session_id (str UUID) → session dict.
+# Each session dict is fully self-contained: own lock, own writer state,
+# own thread.  sessions_lock only guards the top-level dict itself.
+sessions: dict       = {}
+sessions_lock        = threading.Lock()
 
-# ── Global writer state ───────────────────────────────────────────────────────
-# These globals are ONLY ever assigned inside open_writers() / close_writers(),
-# never directly inside detection_loop — that was the "referenced before
-# assignment" bug (Python treats any name assigned anywhere in a function as
-# local for the whole function).
-writer      = None
-csv_file    = None
-csv_writer  = None
-writer_lock = threading.Lock()
+# ── Shared Real-ESRGAN (loaded once, all sessions share the model weights) ────
+# GPU forward passes are serialized by _sr_call_lock so threads don't race on
+# the CUDA context.  Initialization is lazy and guarded by _sr_init_lock.
+_sr_upsampler        = None
+_sr_outscale: int    = 1
+_sr_init_lock        = threading.Lock()
+_sr_initialized      = False
+_sr_call_lock        = threading.Lock()   # one SR call at a time across all streams
 
 app = FastAPI()
 
 
 # ── Request models ────────────────────────────────────────────────────────────
 class StartRequest(BaseModel):
-    rtsp_url:   str
-    labels:     List[str]
-    confidence: float = 0.30
-    every_n:    int   = 5
-    save:       bool  = False
+    rtsp_url:    str
+    labels:      List[str]
+    confidence:  float          = 0.30
+    every_n:     int            = 5
+    save:        bool           = False
+    session_id:  Optional[str]  = None   # caller may supply a human-readable ID
 
 
 class SaveRequest(BaseModel):
     save: bool
 
 
-# ── Writer helpers ────────────────────────────────────────────────────────────
+# ── Session factory ───────────────────────────────────────────────────────────
+def _make_session(sid: str, rtsp_url: str, labels: list, saving: bool) -> dict:
+    return {
+        "id":          sid,
+        "running":     False,
+        "frame":       None,
+        "counts":      {},
+        "fps":         0.0,
+        "frame_idx":   0,
+        "error":       None,
+        "labels":      labels,
+        "rtsp_url":    rtsp_url,
+        "started_at":  None,
+        "saving":      saving,
+        "save_path":   None,
+        # Per-session writer state (replaces old module-level globals)
+        "_writer":     None,
+        "_csv_file":   None,
+        "_csv_writer": None,
+        "_wlock":      threading.Lock(),
+        "_lock":       threading.Lock(),
+        "_thread":     None,
+    }
+
+
+def _session_public(sess: dict) -> dict:
+    """Return only the public-facing keys of a session dict."""
+    return {
+        "id":          sess["id"],
+        "running":     sess["running"],
+        "labels":      sess["labels"],
+        "rtsp_url":    sess["rtsp_url"],
+        "counts":      sess["counts"],
+        "fps":         round(sess["fps"], 2),
+        "frame_idx":   sess["frame_idx"],
+        "started_at":  sess["started_at"],
+        "error":       sess["error"],
+        "saving":      sess["saving"],
+        "save_path":   sess["save_path"],
+    }
+
+
+def _get_session(sid: str) -> dict:
+    with sessions_lock:
+        sess = sessions.get(sid)
+    if sess is None:
+        raise HTTPException(404, f"Session '{sid}' not found.")
+    return sess
+
+
+# ── Writer helpers (per-session) ──────────────────────────────────────────────
 #
 # Strategy:
-#   1. Record into a .mkv scratch file while streaming.
-#      MKV is a streamable container — it never needs a trailer/index written
-#      at the end, so a crash or pipe-break still leaves a playable file.
+#   1. Record into a .mkv scratch file.  MKV is a streamable container — a
+#      crash or pipe-break still leaves a playable file.
 #   2. On close, remux the .mkv → .mp4 with "-movflags +faststart" so the
-#      moov atom lands at the front of the file.  Without faststart, mp4
-#      puts the moov atom at the END and browsers cannot play the file until
-#      the entire download completes.
+#      moov atom lands at the front and browsers can seek immediately.
 #
-def open_writers(ts: str, labels_list: list, width: int, height: int, fps: float):
-    """Start ffmpeg process + CSV file.  Must NOT be called while holding session_lock."""
-    global writer, csv_file, csv_writer
-
-    # Write to MKV scratch — stream-safe, no moov-at-end problem
+def open_writers(sess: dict, ts: str, labels_list: list,
+                 width: int, height: int, fps: float):
+    """Start ffmpeg process + CSV file for a session."""
     scratch = os.path.join(OUTPUT_DIR, f"detection_{ts}.mkv")
     cpath   = os.path.join(OUTPUT_DIR, f"counts_{ts}.csv")
 
@@ -105,101 +141,94 @@ def open_writers(ts: str, labels_list: list, width: int, height: int, fps: float
         scratch,
     ]
 
-    with writer_lock:
+    with sess["_wlock"]:
         new_proc = subprocess.Popen(
             ffmpeg_cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
         )
-        print(f"[ffmpeg] started PID={new_proc.pid}  scratch={scratch}")
+        print(f"[ffmpeg][{sess['id'][:8]}] started PID={new_proc.pid}  scratch={scratch}")
 
         new_csv = open(cpath, "w", newline="")
         new_cw  = csv.writer(new_csv)
         new_cw.writerow(["frame", "timestamp"] + labels_list + ["total_tracks", "fps"])
 
-        writer     = new_proc
-        csv_file   = new_csv
-        csv_writer = new_cw
+        sess["_writer"]     = new_proc
+        sess["_csv_file"]   = new_csv
+        sess["_csv_writer"] = new_cw
 
-    # Expose the scratch path so the UI can show "recording…"
-    with session_lock:
-        session["save_path"] = scratch
+    with sess["_lock"]:
+        sess["save_path"] = scratch
 
-    print(f"[writer] scratch → {scratch}")
-    print(f"[writer] CSV     → {cpath}")
+    print(f"[writer][{sess['id'][:8]}] scratch → {scratch}")
+    print(f"[writer][{sess['id'][:8]}] CSV     → {cpath}")
 
 
-def _remux_to_mp4(scratch: str) -> str:
-    """Remux MKV scratch file → browser-playable MP4 with moov atom at front.
-    Runs synchronously in a background thread after close_writers()."""
+def _remux_to_mp4(scratch: str, sid_prefix: str) -> str:
     mp4_path = scratch.replace(".mkv", ".mp4")
     cmd = [
         "ffmpeg", "-y",
         "-i",        scratch,
-        "-codec",    "copy",          # no re-encode — just rewrap
-        "-movflags", "+faststart",    # moov atom at front → browser can play immediately
+        "-codec",    "copy",
+        "-movflags", "+faststart",
         mp4_path,
     ]
-    print(f"[remux] {scratch} → {mp4_path}")
+    print(f"[remux][{sid_prefix}] {scratch} → {mp4_path}")
     result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     if result.returncode == 0:
-        os.remove(scratch)            # delete scratch only on success
-        print(f"[remux] done → {mp4_path}")
+        os.remove(scratch)
+        print(f"[remux][{sid_prefix}] done → {mp4_path}")
         return mp4_path
     else:
         err = result.stderr.decode(errors="replace")
-        print(f"[remux] FAILED: {err}")
-        return scratch                # fall back to mkv if remux fails
+        print(f"[remux][{sid_prefix}] FAILED: {err}")
+        return scratch
 
 
-def close_writers():
-    """Flush and close ffmpeg + CSV, then remux to browser-playable MP4.
-    Safe to call even if already closed."""
-    global writer, csv_file, csv_writer
+def close_writers(sess: dict):
+    """Flush and close ffmpeg + CSV for a session, then remux to MP4."""
+    scratch_path  = None
+    sid_prefix    = sess["id"][:8]
 
-    scratch_path = None
-
-    with writer_lock:
-        if writer is not None:
+    with sess["_wlock"]:
+        if sess["_writer"] is not None:
             try:
-                writer.stdin.close()
-                writer.wait()
-                # Capture the scratch path from stderr/argv isn't easy here,
-                # so we derive it from session (set in open_writers).
+                sess["_writer"].stdin.close()
+                sess["_writer"].wait()
             except Exception as exc:
-                print(f"[ffmpeg] close error: {exc}")
-            writer = None
+                print(f"[ffmpeg][{sid_prefix}] close error: {exc}")
+            sess["_writer"] = None
 
-        if csv_file is not None:
+        if sess["_csv_file"] is not None:
             try:
-                csv_file.close()
+                sess["_csv_file"].close()
             except Exception as exc:
-                print(f"[csv] close error: {exc}")
-            csv_file = None
+                print(f"[csv][{sid_prefix}] close error: {exc}")
+            sess["_csv_file"]   = None
+            sess["_csv_writer"] = None
 
-        csv_writer = None
+    with sess["_lock"]:
+        scratch_path    = sess.get("save_path")
+        sess["save_path"] = None
 
-    # Grab the scratch path before clearing it
-    with session_lock:
-        scratch_path = session.get("save_path")
-        session["save_path"] = None
+    print(f"[writer][{sid_prefix}] closed")
 
-    print("[writer] closed")
-
-    # Remux MKV → MP4 in a background thread so we don't block the detection loop
     if scratch_path and scratch_path.endswith(".mkv") and os.path.exists(scratch_path):
-        threading.Thread(target=_remux_to_mp4, args=(scratch_path,), daemon=True).start()
+        threading.Thread(
+            target=_remux_to_mp4, args=(scratch_path, sid_prefix), daemon=True
+        ).start()
 
 
-# ── Background cleanup (delete files older than 30 min) ──────────────────────
+# ── Background cleanup (delete output files older than 30 min) ───────────────
 def cleanup_loop():
     while True:
         try:
             cutoff = time.time() - 30 * 60
             if os.path.exists(OUTPUT_DIR):
                 for fname in os.listdir(OUTPUT_DIR):
-                    if not (fname.endswith(".mp4") or fname.endswith(".mkv") or fname.endswith(".csv")):
+                    if not (fname.endswith(".mp4") or fname.endswith(".mkv")
+                            or fname.endswith(".csv")):
                         continue
                     fpath = os.path.join(OUTPUT_DIR, fname)
                     if os.path.getmtime(fpath) < cutoff:
@@ -210,22 +239,11 @@ def cleanup_loop():
         time.sleep(300)
 
 
-# ── Real-ESRGAN super-resolution (optional quality layer) ────────────────────
-#
-# When `realesrgan` + `basicsr` are installed, the full frame is upscaled 2×
-# before SAM3 sees it.  This synthesises real detail rather than just
-# bicubic interpolation, making transparent/mesh objects detectable at distance.
-# Graceful fallback: if the package is absent the code continues unchanged.
-# Auto-download: RealESRGAN_x2plus.pth (~67 MB) is fetched from GitHub on
-# first use and saved next to sam3.pt.
-
+# ── Real-ESRGAN super-resolution (shared, loaded once) ───────────────────────
 def _load_realesrgan(model_dir: str):
     """
-    Load RealESRGAN_x4plus — the largest general-purpose SR model.
-    We use the x4 model but request outscale=2 in _apply_sr, which gives
-    richer synthesised detail than the native x2 model at the same output size.
-    With 16 GB VRAM the x4 model fits entirely on-GPU with no memory pressure.
-    Returns (upsampler, outscale) or (None, 1) if the package is absent.
+    Load RealESRGAN_x4plus.  Called at most once; result cached in module-level
+    globals.  Returns (upsampler, outscale) or (None, 1) if unavailable.
     """
     try:
         from realesrgan import RealESRGANer
@@ -239,7 +257,6 @@ def _load_realesrgan(model_dir: str):
     weight_path = os.path.join(model_dir, weight_name)
 
     if not os.path.exists(weight_path):
-        # x4plus weights live under the v0.1.0 release tag
         url = ("https://github.com/xinntao/Real-ESRGAN/releases/download/"
                f"v0.1.0/{weight_name}")
         print(f"[esrgan] downloading {weight_name} (~67 MB)…")
@@ -260,28 +277,35 @@ def _load_realesrgan(model_dir: str):
             scale=4,
             model_path=weight_path,
             model=arch,
-            tile=512,       # large tile — 16 GB VRAM handles this comfortably
+            tile=512,
             tile_pad=16,
             pre_pad=0,
-            half=True,      # fp16 is fine on RTX 5060, halves VRAM & speeds up
+            half=True,
             device="cuda" if torch.cuda.is_available() else "cpu",
         )
         print("[esrgan] RealESRGAN_x4plus ready (outscale=2, tile=512, fp16)")
-        return up, 2       # outscale=2: x4 model → 2× output (best quality at 2×)
+        return up, 2
     except Exception as exc:
         print(f"[esrgan] init failed: {exc} — SR disabled")
         return None, 1
 
 
+def _get_realesrgan():
+    """Lazy-init Real-ESRGAN once for the whole process."""
+    global _sr_upsampler, _sr_outscale, _sr_initialized
+    with _sr_init_lock:
+        if not _sr_initialized:
+            _sr_upsampler, _sr_outscale = _load_realesrgan(
+                os.path.dirname(MODEL_PATH))
+            _sr_initialized = True
+    return _sr_upsampler, _sr_outscale
+
+
 def _apply_sr(frame: np.ndarray, upsampler, outscale: int = 2) -> np.ndarray:
-    """
-    Upscale frame with Real-ESRGAN x4plus, output at outscale× size.
-    Using the x4 model with outscale=2 produces cleaner 2× results than
-    the native x2 model because the larger network captures more texture.
-    """
     try:
-        out_rgb, _ = upsampler.enhance(
-            cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), outscale=outscale)
+        with _sr_call_lock:   # serialize GPU SR calls across all sessions
+            out_rgb, _ = upsampler.enhance(
+                cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), outscale=outscale)
         return cv2.cvtColor(out_rgb, cv2.COLOR_RGB2BGR)
     except Exception as exc:
         print(f"[esrgan] enhance error: {exc}")
@@ -289,7 +313,6 @@ def _apply_sr(frame: np.ndarray, upsampler, outscale: int = 2) -> np.ndarray:
 
 
 def _scale_boxes(xyxy: np.ndarray, sx: float, sy: float) -> np.ndarray:
-    """Scale detection boxes from SR-space back to original-frame coordinates."""
     out = xyxy.copy()
     out[:, [0, 2]] *= sx
     out[:, [1, 3]] *= sy
@@ -299,7 +322,7 @@ def _scale_boxes(xyxy: np.ndarray, sx: float, sy: float) -> np.ndarray:
 # ── Pre-inference quality enhancement ────────────────────────────────────────
 # CLAHE on the LAB L-channel only — lifts local contrast so faint cap/glove
 # boundaries become visible in low-contrast or distant scenes.
-# Unsharp masking is intentionally omitted: it adds ringing artifacts around
+# Unsharp masking intentionally omitted: it adds ringing artifacts around
 # edges that break SAM3's text-to-visual matching for surgical caps and gloves.
 
 _CLAHE = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
@@ -313,13 +336,10 @@ def _enhance(img: np.ndarray) -> np.ndarray:
 
 
 # ── SAHI: tiled inference ─────────────────────────────────────────────────────
-# Divides the frame into overlapping tiles and runs SAM3 on each one.
-# A person 50 m away may be only ~20 px tall in a 1080p frame.  With 2×2
-# tiling each tile covers half the width/height, so that same person is ~38 px
-# inside the tile — almost 2× the effective resolution for SAM3.
-
 def _run_sahi(frame: np.ndarray, predictor, labels: list,
               n_cols: int, n_rows: int, overlap: float = 0.20) -> sv.Detections:
+    if not labels:
+        return sv.Detections.empty()
     fh, fw   = frame.shape[:2]
     tile_w   = int(fw / (n_cols - overlap * (n_cols - 1)))
     tile_h   = int(fh / (n_rows - overlap * (n_rows - 1)))
@@ -335,7 +355,8 @@ def _run_sahi(frame: np.ndarray, predictor, labels: list,
             x2 = min(x1 + tile_w, fw)
             y2 = min(y1 + tile_h, fh)
             tile = frame[y1:y2, x1:x2]
-            if tile.size == 0:
+            # Skip degenerate tiles that would crash CLAHE (needs >= tileGridSize=8)
+            if tile.size == 0 or tile.shape[0] < 32 or tile.shape[1] < 32:
                 continue
 
             tile = _enhance(tile)
@@ -371,12 +392,9 @@ def _run_sahi(frame: np.ndarray, predictor, labels: list,
 
 def _infer_full_frame(frame: np.ndarray, predictor,
                       labels: list) -> sv.Detections:
-    """
-    Single SAM3 inference on the entire frame (enhanced but not tiled).
-    Catches objects that SAHI misses because they straddle tile boundaries —
-    e.g. gloves on hands near the edge of a tile, or a surgical cap whose
-    top is cropped off in one tile and bottom in the next.
-    """
+    """Single SAM3 inference on the entire frame — catches objects at tile boundaries."""
+    if not labels:
+        return sv.Detections.empty()
     pil = PILImage.fromarray(
         cv2.cvtColor(_enhance(frame), cv2.COLOR_BGR2RGB))
     try:
@@ -413,22 +431,24 @@ def _merge(*dets_list) -> sv.Detections:
     return merged.with_nms(threshold=0.45)
 
 
-# ── Detection loop ────────────────────────────────────────────────────────────
-def detection_loop(rtsp_url: str, labels: list, confidence: float,
-                   every_n: int, save_on_start: bool):
+# ── Detection loop (per-session) ──────────────────────────────────────────────
+def detection_loop(sess: dict, confidence: float, every_n: int):
+    sid = sess["id"]
+    labels = sess["labels"]
+    rtsp_url = sess["rtsp_url"]
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    # ── Load model ────────────────────────────────────────────────────────────
-    print("[sam3] loading model...")
+    # ── Load SAM3 (one instance per session) ──────────────────────────────────
+    print(f"[sam3][{sid[:8]}] loading model...")
     overrides = dict(
         conf=confidence, task="segment", mode="predict",
         model=MODEL_PATH, half=True, imgsz=1280, verbose=False,
     )
     predictor = SAM3SemanticPredictor(overrides=overrides)
-    print("[sam3] model loaded")
+    print(f"[sam3][{sid[:8]}] model loaded")
 
-    # Real-ESRGAN x4plus — loaded once, applied every inference cycle
-    upsampler, sr_outscale = _load_realesrgan(os.path.dirname(MODEL_PATH))
+    # Shared Real-ESRGAN (lazy init, loaded once for all sessions)
+    upsampler, sr_outscale = _get_realesrgan()
 
     # ── Tracker + annotators ──────────────────────────────────────────────────
     tracker   = ByteTrack(track_activation_threshold=0.25, lost_track_buffer=30,
@@ -438,43 +458,42 @@ def detection_loop(rtsp_url: str, labels: list, confidence: float,
     trace_ann = sv.TraceAnnotator(thickness=2, trace_length=40)
 
     # ── Open RTSP ─────────────────────────────────────────────────────────────
-    print(f"[rtsp] connecting -> {rtsp_url}")
+    print(f"[rtsp][{sid[:8]}] connecting -> {rtsp_url}")
     cap = cv2.VideoCapture(rtsp_url)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     if not cap.isOpened():
-        with session_lock:
-            session["error"]   = "Could not open RTSP stream"
-            session["running"] = False
-        print("[rtsp] ERROR: could not open stream")
+        with sess["_lock"]:
+            sess["error"]   = "Could not open RTSP stream"
+            sess["running"] = False
+        print(f"[rtsp][{sid[:8]}] ERROR: could not open stream")
         return
 
     stream_fps = cap.get(cv2.CAP_PROP_FPS) or 15
     width      = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height     = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    print(f"[rtsp] {width}x{height} @ {stream_fps:.1f} fps")
+    if width <= 0 or height <= 0:
+        with sess["_lock"]:
+            sess["error"]   = "Stream reported invalid resolution (0×0)"
+            sess["running"] = False
+        print(f"[rtsp][{sid[:8]}] ERROR: invalid resolution")
+        cap.release()
+        return
+    print(f"[rtsp][{sid[:8]}] {width}x{height} @ {stream_fps:.1f} fps")
 
-    # Always 3×3 tiles — with 16 GB VRAM and imgsz=1280, the GPU handles
-    # 9 tiles comfortably.  3×3 gives ~1.7× more pixels per object vs 2×2,
-    # which is the single biggest boost for small/distant objects.
     n_cols, n_rows = 3, 3
-    print(f"[sahi] {n_cols}×{n_rows} tile grid (fixed)")
+    print(f"[sahi][{sid[:8]}] {n_cols}×{n_rows} tile grid (fixed)")
 
-    # ── Open writers if requested at start ────────────────────────────────────
+    # ── Open writers if save was requested at start ────────────────────────────
+    with sess["_lock"]:
+        save_on_start = sess["saving"]
     if save_on_start:
-        open_writers(datetime.now().strftime("%Y%m%d_%H%M%S"),
+        open_writers(sess, datetime.now().strftime("%Y%m%d_%H%M%S"),
                      labels, width, height, stream_fps)
-        with session_lock:
-            session["saving"] = True   # keep flag in sync
 
     # ── Delay buffer + inference thread ───────────────────────────────────────
-    # Strategy: buffer every frame for STREAM_DELAY_S seconds.  The inference
-    # thread processes frames as they arrive and stores results keyed by frame
-    # index.  The display loop always shows the frame from STREAM_DELAY_S ago,
-    # by which time its inference results are ready — giving accurate detections
-    # with zero async mismatch, at the cost of a visible 3-second delay.
-
-    display_buf    = deque()   # (timestamp, frame_idx, raw_frame)
-    det_store      = {}        # frame_idx → sv.Detections
+    _buf_maxlen = max(200, int(stream_fps * (STREAM_DELAY_S + 10)))
+    display_buf    = deque(maxlen=_buf_maxlen)
+    det_store      = {}
     det_store_lock = threading.Lock()
 
     infer = {
@@ -514,16 +533,15 @@ def detection_loop(rtsp_url: str, labels: list, confidence: float,
 
                 full_dets = _infer_full_frame(f, predictor, labels)
                 dets = _merge(sahi_dets, full_dets)
-                print(f"[infer] fid={fid} sahi={len(sahi_dets)} "
+                print(f"[infer][{sid[:8]}] fid={fid} sahi={len(sahi_dets)} "
                       f"full={len(full_dets)} merged={len(dets)} "
                       f"{(time.time()-t0)*1000:.0f} ms")
             except Exception as exc:
-                print(f"[infer] error: {exc}")
+                print(f"[infer][{sid[:8]}] error: {exc}")
                 dets = sv.Detections.empty()
 
             with det_store_lock:
                 det_store[fid] = dets
-                # Keep only recent entries to avoid unbounded memory growth
                 cutoff = fid - int(stream_fps * (STREAM_DELAY_S + 5))
                 for k in [k for k in det_store if k < cutoff]:
                     del det_store[k]
@@ -532,61 +550,82 @@ def detection_loop(rtsp_url: str, labels: list, confidence: float,
     infer_thread.start()
 
     # ── Loop state ────────────────────────────────────────────────────────────
-    frame_idx    = 0
-    t_start      = time.time()
-    t_frame      = t_start
-    fps_display  = 0.0
-    last_sv_dets = sv.Detections.empty()
+    frame_idx       = 0
+    reconnect_count = 0
+    MAX_RECONNECTS  = 10
+    t_start         = time.time()
+    t_frame         = t_start
+    fps_display     = 0.0
+    last_sv_dets    = sv.Detections.empty()
 
-    # Build a "buffering" placeholder shown during the initial delay window
-    buf_frame = np.zeros((height, width, 3), dtype=np.uint8)
-    cv2.putText(buf_frame, "Buffering — please wait...",
-                (width // 2 - 220, height // 2),
-                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (200, 200, 200), 2)
+    # Buffering placeholder — resolution-safe text placement
+    buf_frame  = np.zeros((height, width, 3), dtype=np.uint8)
+    _buf_text  = "Buffering..."
+    _buf_scale = max(0.4, min(1.0, width / 640))
+    _buf_thick = max(1, int(_buf_scale * 2))
+    (_tw, _th), _ = cv2.getTextSize(_buf_text, cv2.FONT_HERSHEY_SIMPLEX,
+                                    _buf_scale, _buf_thick)
+    _bx = max(5, (width  - _tw) // 2)
+    _by = max(20, height // 2)
+    cv2.putText(buf_frame, _buf_text, (_bx, _by),
+                cv2.FONT_HERSHEY_SIMPLEX, _buf_scale, (200, 200, 200), _buf_thick)
 
-    with session_lock:
-        session["running"]    = True
-        session["started_at"] = datetime.now().isoformat()
-        session["error"]      = None
-        session["frame"]      = buf_frame.copy()
+    with sess["_lock"]:
+        sess["running"]    = True
+        sess["started_at"] = datetime.now().isoformat()
+        sess["error"]      = None
+        sess["frame"]      = buf_frame.copy()
 
     try:
         while True:
-            # ── Stop / save-toggle signals ────────────────────────────────────
-            with session_lock:
-                should_run  = session["running"]
-                should_save = session["saving"]
+            # ── Stop / save-toggle signals ─────────────────────────────────────
+            with sess["_lock"]:
+                should_run  = sess["running"]
+                should_save = sess["saving"]
 
             if not should_run:
-                print("[loop] stop signal received")
+                print(f"[loop][{sid[:8]}] stop signal received")
                 break
 
-            with writer_lock:
-                writer_active = writer is not None
+            with sess["_wlock"]:
+                writer_active = sess["_writer"] is not None
 
             if should_save and not writer_active:
-                open_writers(datetime.now().strftime("%Y%m%d_%H%M%S"),
+                open_writers(sess, datetime.now().strftime("%Y%m%d_%H%M%S"),
                              labels, width, height, stream_fps)
             elif not should_save and writer_active:
-                close_writers()
+                close_writers(sess)
 
-            # ── Read frame ────────────────────────────────────────────────────
+            # ── Read frame ─────────────────────────────────────────────────────
             ret, frame = cap.read()
             if not ret:
-                with session_lock:
-                    if not session["running"]:
+                with sess["_lock"]:
+                    if not sess["running"]:
                         break
-                print("[rtsp] stream lost -- reconnecting...")
+                reconnect_count += 1
+                if reconnect_count > MAX_RECONNECTS:
+                    print(f"[rtsp][{sid[:8]}] {MAX_RECONNECTS} reconnect attempts exhausted")
+                    with sess["_lock"]:
+                        sess["error"] = "RTSP stream lost after max reconnect attempts"
+                    break
+                backoff = min(2 ** (reconnect_count - 1), 30)
+                print(f"[rtsp][{sid[:8]}] stream lost — reconnecting "
+                      f"({reconnect_count}/{MAX_RECONNECTS}) in {backoff}s…")
                 cap.release()
-                time.sleep(2)
-                with session_lock:
-                    if not session["running"]:
+                display_buf.clear()
+                with det_store_lock:
+                    det_store.clear()
+                last_sv_dets = sv.Detections.empty()
+                time.sleep(backoff)
+                with sess["_lock"]:
+                    if not sess["running"]:
                         break
                 cap = cv2.VideoCapture(rtsp_url)
                 cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                 if not cap.isOpened():
-                    print("[rtsp] reconnect failed")
-                    break
+                    print(f"[rtsp][{sid[:8]}] reconnect failed")
+                    continue
+                reconnect_count = 0
                 continue
 
             if MAX_FRAMES and frame_idx >= MAX_FRAMES:
@@ -595,16 +634,14 @@ def detection_loop(rtsp_url: str, labels: list, confidence: float,
             # ── Buffer current frame ───────────────────────────────────────────
             display_buf.append((time.time(), frame_idx, frame.copy()))
 
-            # ── Trigger inference for this frame ───────────────────────────────
+            # ── Trigger inference ──────────────────────────────────────────────
             if frame_idx % every_n == 0:
                 with infer["lock"]:
                     infer["frame_idx"] = frame_idx
                     infer["frame"]     = frame.copy()
                 infer["event"].set()
 
-            # ── Pull the delayed display frame ────────────────────────────────
-            # Consume all buffer entries older than STREAM_DELAY_S, keep the
-            # most recent one as the frame to display this iteration.
+            # ── Pull delayed display frame ─────────────────────────────────────
             now = time.time()
             display_frame = None
             display_fid   = None
@@ -614,17 +651,17 @@ def detection_loop(rtsp_url: str, labels: list, confidence: float,
                 display_fid   = fid_d
 
             if display_frame is None:
-                # Buffer still filling — keep showing the placeholder
                 frame_idx += 1
+                time.sleep(1.0 / stream_fps)
                 continue
 
-            # ── Match best inference result to the display frame ───────────────
+            # ── Match best inference result ────────────────────────────────────
             with det_store_lock:
                 candidates = [k for k in det_store if k <= display_fid]
                 if candidates:
                     last_sv_dets = det_store[max(candidates)]
 
-            # ── ByteTrack every frame ─────────────────────────────────────────
+            # ── ByteTrack ──────────────────────────────────────────────────────
             tracked     = tracker.update_with_detections(last_sv_dets)
             counts      = defaultdict(int)
             label_texts = []
@@ -638,45 +675,42 @@ def detection_loop(rtsp_url: str, labels: list, confidence: float,
                 counts[name] += 1
                 label_texts.append(f"#{tid} {name} {conf:.2f}")
 
-            # ── Annotate ──────────────────────────────────────────────────────
+            # ── Annotate ───────────────────────────────────────────────────────
             annotated = display_frame.copy()
             annotated = trace_ann.annotate(annotated, tracked)
             annotated = box_ann.annotate(annotated, tracked)
             if label_texts:
                 annotated = lbl_ann.annotate(annotated, tracked, labels=label_texts)
 
-            # ── Timing ────────────────────────────────────────────────────────
+            # ── Timing ─────────────────────────────────────────────────────────
             now         = time.time()
             fps_display = 1.0 / max(now - t_frame, 1e-6)
             t_frame     = now
             elapsed     = now - t_start
 
-            # ── Push annotated frame to browser stream ────────────────────────
-            with session_lock:
-                session["frame"]     = annotated.copy()
-                session["counts"]    = dict(counts)
-                session["fps"]       = fps_display
-                session["frame_idx"] = frame_idx
+            # ── Push to session ────────────────────────────────────────────────
+            with sess["_lock"]:
+                sess["frame"]     = annotated.copy()
+                sess["counts"]    = dict(counts)
+                sess["fps"]       = fps_display
+                sess["frame_idx"] = frame_idx
 
-            # ── Write to disk ─────────────────────────────────────────────────
-            with session_lock:
-                currently_saving = session["saving"]
-
-            with writer_lock:
-                current_writer = writer
-                current_cw     = csv_writer
+            # ── Write to disk ──────────────────────────────────────────────────
+            with sess["_lock"]:
+                currently_saving = sess["saving"]
+            with sess["_wlock"]:
+                current_writer = sess["_writer"]
+                current_cw     = sess["_csv_writer"]
 
             if currently_saving and current_writer is not None:
                 try:
                     current_writer.stdin.write(annotated.tobytes())
                     current_writer.stdin.flush()
                 except BrokenPipeError:
-                    print("[ffmpeg] broken pipe -- stopping save")
-                    close_writers()
-                    with session_lock:
-                        session["saving"] = False
-            elif currently_saving and current_writer is None:
-                print(f"[debug] saving=True but writer is None at frame={frame_idx}")
+                    print(f"[ffmpeg][{sid[:8]}] broken pipe — stopping save")
+                    close_writers(sess)
+                    with sess["_lock"]:
+                        sess["saving"] = False
 
             if current_cw is not None:
                 row  = [display_fid, round(elapsed, 2)]
@@ -685,101 +719,151 @@ def detection_loop(rtsp_url: str, labels: list, confidence: float,
                 current_cw.writerow(row)
 
             if frame_idx % 30 == 0:
-                print(f"[loop] frame={frame_idx:05d} fps={fps_display:.1f} counts={dict(counts)}")
+                print(f"[loop][{sid[:8]}] frame={frame_idx:05d} "
+                      f"fps={fps_display:.1f} counts={dict(counts)}")
 
             frame_idx += 1
 
     except Exception as exc:
-        with session_lock:
-            session["error"] = str(exc)
-        print(f"[loop] ERROR: {exc}")
+        with sess["_lock"]:
+            sess["error"] = str(exc)
+        print(f"[loop][{sid[:8]}] ERROR: {exc}")
     finally:
         infer["running"] = False
         infer["event"].set()
         infer_thread.join(timeout=5)
         cap.release()
-        close_writers()
-        with session_lock:
-            session["running"] = False
-            session["saving"]  = False
-        print("[loop] stopped")
+        close_writers(sess)
+        with sess["_lock"]:
+            sess["running"] = False
+            sess["saving"]  = False
+        print(f"[loop][{sid[:8]}] stopped")
 
 
 # ── API endpoints ─────────────────────────────────────────────────────────────
 
 @app.post("/session/start")
 def start_session(req: StartRequest):
-    global session_thread
-    with session_lock:
-        if session["running"]:
-            raise HTTPException(409, "Session already running. Stop it first.")
-        if not req.labels:
-            raise HTTPException(400, "Provide at least one label.")
-        session.update({
-            "labels":    req.labels,
-            "rtsp_url":  req.rtsp_url,
-            "frame":     None,
-            "counts":    {},
-            "fps":       0.0,
-            "frame_idx": 0,
-            "error":     None,
-            "saving":    req.save,
-            "save_path": None,
-        })
+    if not req.labels:
+        raise HTTPException(400, "Provide at least one label.")
 
-    session_thread = threading.Thread(
+    sid = req.session_id or str(uuid.uuid4())
+
+    with sessions_lock:
+        if sid in sessions and sessions[sid]["running"]:
+            raise HTTPException(409, f"Session '{sid}' is already running.")
+        sess = _make_session(sid, req.rtsp_url, req.labels, req.save)
+        sessions[sid] = sess
+
+    t = threading.Thread(
         target=detection_loop,
-        args=(req.rtsp_url, req.labels, req.confidence, req.every_n, req.save),
+        args=(sess, req.confidence, req.every_n),
         daemon=True,
     )
-    session_thread.start()
-    return {"status": "started", "labels": req.labels, "rtsp_url": req.rtsp_url}
+    sess["_thread"] = t
+    t.start()
+    return {"status": "started", "session_id": sid,
+            "labels": req.labels, "rtsp_url": req.rtsp_url}
 
 
-@app.post("/session/stop")
-def stop_session():
-    with session_lock:
-        if not session["running"]:
+@app.post("/session/{session_id}/stop")
+def stop_session(session_id: str):
+    sess = _get_session(session_id)
+    with sess["_lock"]:
+        if not sess["running"]:
             return {"status": "not running"}
-        session["running"] = False
-        session["saving"]  = False
+        sess["running"] = False
+        sess["saving"]  = False
 
-    def _clear_after_delay():
+    def _cleanup():
         time.sleep(4)
-        with session_lock:
-            session["frame"]     = None
-            session["counts"]    = {}
-            session["fps"]       = 0.0
-            session["frame_idx"] = 0
+        with sessions_lock:
+            sessions.pop(session_id, None)
 
-    threading.Thread(target=_clear_after_delay, daemon=True).start()
-    return {"status": "stopping"}
+    threading.Thread(target=_cleanup, daemon=True).start()
+    return {"status": "stopping", "session_id": session_id}
 
 
-@app.post("/session/save")
-def toggle_save(req: SaveRequest):
-    with session_lock:
-        if not session["running"]:
-            raise HTTPException(400, "No session running.")
-        session["saving"] = req.save
-    return {"status": "saving" if req.save else "not saving"}
+@app.post("/session/{session_id}/save")
+def toggle_save(session_id: str, req: SaveRequest):
+    sess = _get_session(session_id)
+    with sess["_lock"]:
+        if not sess["running"]:
+            raise HTTPException(400, "Session is not running.")
+        sess["saving"] = req.save
+    return {"status": "saving" if req.save else "not saving", "session_id": session_id}
 
 
-@app.get("/session/status")
-def session_status():
-    with session_lock:
-        return JSONResponse({
-            "running":    session["running"],
-            "labels":     session["labels"],
-            "rtsp_url":   session["rtsp_url"],
-            "counts":     session["counts"],
-            "fps":        round(session["fps"], 2),
-            "frame_idx":  session["frame_idx"],
-            "started_at": session["started_at"],
-            "error":      session["error"],
-            "saving":     session["saving"],
-            "save_path":  session["save_path"],
-        })
+@app.get("/session/{session_id}/status")
+def session_status(session_id: str):
+    sess = _get_session(session_id)
+    with sess["_lock"]:
+        return JSONResponse(_session_public(sess))
+
+
+@app.get("/sessions")
+def list_sessions():
+    with sessions_lock:
+        sids = list(sessions.keys())
+    result = []
+    for sid in sids:
+        with sessions_lock:
+            sess = sessions.get(sid)
+        if sess is None:
+            continue
+        with sess["_lock"]:
+            result.append(_session_public(sess))
+    return JSONResponse(result)
+
+
+@app.get("/stream/{session_id}")
+def stream_session(session_id: str):
+    """MJPEG stream for a specific session."""
+    sess = _get_session(session_id)
+
+    def _generate():
+        while True:
+            with sess["_lock"]:
+                running = sess["running"]
+                frame   = sess["frame"]
+            if frame is None:
+                frame = np.zeros((360, 640, 3), dtype=np.uint8)
+                cv2.putText(frame, "Waiting for stream...", (120, 180),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (60, 60, 60), 2)
+            _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            yield (b"--frame\r\n"
+                   b"Content-Type: image/jpeg\r\n\r\n" + buf.tobytes() + b"\r\n")
+            if not running:
+                break
+            time.sleep(0.033)
+
+    return StreamingResponse(_generate(),
+                             media_type="multipart/x-mixed-replace; boundary=frame")
+
+
+@app.get("/video")
+def video_feed():
+    """Backward-compatible single-stream endpoint — serves the first active session."""
+    def _generate():
+        while True:
+            frame = None
+            with sessions_lock:
+                for sess in sessions.values():
+                    with sess["_lock"]:
+                        if sess["running"] and sess["frame"] is not None:
+                            frame = sess["frame"].copy()
+                            break
+            if frame is None:
+                frame = np.zeros((360, 640, 3), dtype=np.uint8)
+                cv2.putText(frame, "No active session", (120, 180),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (60, 60, 60), 2)
+            _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            yield (b"--frame\r\n"
+                   b"Content-Type: image/jpeg\r\n\r\n" + buf.tobytes() + b"\r\n")
+            time.sleep(0.033)
+
+    return StreamingResponse(_generate(),
+                             media_type="multipart/x-mixed-replace; boundary=frame")
 
 
 @app.get("/recordings")
@@ -799,7 +883,7 @@ def list_recordings():
     return JSONResponse(files)
 
 
-CHUNK_SIZE = 1024 * 256  # 256 KB per read — fast seek, low memory
+CHUNK_SIZE = 1024 * 256  # 256 KB per read
 
 @app.api_route("/recordings/{filename}", methods=["GET", "HEAD"])
 async def stream_recording(filename: str, request: Request):
@@ -812,7 +896,6 @@ async def stream_recording(filename: str, request: Request):
     range_header = request.headers.get("range")
     mime_type    = "video/mp4" if filename.endswith(".mp4") else "video/x-matroska"
 
-    # HEAD — browser uses this to discover file size and range support
     if request.method == "HEAD":
         return Response(
             status_code=200,
@@ -824,13 +907,10 @@ async def stream_recording(filename: str, request: Request):
             },
         )
 
-    # Range request — browsers ALWAYS use this for <video> seek/play
     if range_header:
         range_val = range_header.strip().lower().replace("bytes=", "")
         parts     = range_val.split("-")
         start     = int(parts[0]) if parts[0] else 0
-        # If end is omitted (e.g. "bytes=0-"), serve up to 2 MB so the
-        # browser gets the moov atom quickly without reading the whole file.
         if len(parts) > 1 and parts[1]:
             end = int(parts[1])
         else:
@@ -861,7 +941,6 @@ async def stream_recording(filename: str, request: Request):
             },
         )
 
-    # No Range header — stream the whole file in chunks
     def _iter_full():
         with open(fpath, "rb") as f:
             while True:
@@ -880,25 +959,6 @@ async def stream_recording(filename: str, request: Request):
             "Content-Type":   mime_type,
         },
     )
-
-
-@app.get("/video")
-def video_feed():
-    def _generate():
-        while True:
-            with session_lock:
-                frame = session["frame"]
-            if frame is None:
-                frame = np.zeros((360, 640, 3), dtype=np.uint8)
-                cv2.putText(frame, "Waiting for stream...", (120, 180),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (60, 60, 60), 2)
-            _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-            yield (b"--frame\r\n"
-                   b"Content-Type: image/jpeg\r\n\r\n" + buf.tobytes() + b"\r\n")
-            time.sleep(0.033)   # ~30 fps cap for the browser stream
-
-    return StreamingResponse(_generate(),
-                             media_type="multipart/x-mixed-replace; boundary=frame")
 
 
 @app.get("/resources")
@@ -932,9 +992,10 @@ def resources():
 @app.get("/health")
 def health():
     return {
-        "status": "ok",
-        "gpu":    torch.cuda.is_available(),
-        "device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
+        "status":  "ok",
+        "gpu":     torch.cuda.is_available(),
+        "device":  torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
+        "sessions": len(sessions),
     }
 
 
@@ -948,4 +1009,4 @@ def index():
 @app.on_event("startup")
 def _startup():
     threading.Thread(target=cleanup_loop, daemon=True).start()
-    print("[server] SAM3 detection server ready")
+    print("[server] SAM3 multi-stream detection server ready")
