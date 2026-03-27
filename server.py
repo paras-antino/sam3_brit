@@ -10,6 +10,12 @@ from collections import defaultdict, deque
 from datetime import datetime
 from typing import List, Optional
 
+# Reduce CUDA memory fragmentation — must be set before torch is imported.
+# expandable_segments allows PyTorch to grow/shrink segments instead of
+# reserving a fixed block, which is the main cause of "reserved but
+# unallocated" OOM errors when running multiple large inference passes.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import cv2
 import numpy as np
 import torch
@@ -278,13 +284,13 @@ def _load_realesrgan(model_dir: str):
             scale=4,
             model_path=weight_path,
             model=arch,
-            tile=512,
+            tile=256,       # reduced from 512 — leaves more VRAM for SAM3 passes
             tile_pad=16,
             pre_pad=0,
             half=True,
             device="cuda" if torch.cuda.is_available() else "cpu",
         )
-        print("[esrgan] RealESRGAN_x4plus ready (outscale=2, tile=512, fp16)")
+        print("[esrgan] RealESRGAN_x4plus ready (outscale=2, tile=256, fp16)")
         return up, 2
     except Exception as exc:
         print(f"[esrgan] init failed: {exc} — SR disabled")
@@ -329,11 +335,24 @@ def _scale_boxes(xyxy: np.ndarray, sx: float, sy: float) -> np.ndarray:
 #   night    <  25   — near-total darkness, IR cameras, night-shift
 
 def _brightness_level(frame: np.ndarray) -> str:
+    """
+    Classify scene lighting robustly against HDR scenes.
+    A dark room with a bright doorway has a misleadingly high MEAN but the
+    relevant objects (workers) are in the dark area.
+    Strategy: use the 20th percentile of luminance (the darker half of the
+    scene) as the primary signal, not the mean.  This correctly classifies
+    "dark room + bright exit" as night/very_low rather than normal.
+    """
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    # p20 = brightness of the darkest 20% of pixels (where workers typically are)
+    p20  = float(np.percentile(gray, 20))
     mean = float(gray.mean())
-    if mean >= 100: return "normal"
-    if mean >= 55:  return "low"
-    if mean >= 25:  return "very_low"
+    # If there's a large gap between mean and p20, the scene is HDR-backlit:
+    # use the darker metric to drive enhancement.
+    score = p20 * 0.7 + mean * 0.3   # weight darker regions more heavily
+    if score >= 90: return "normal"
+    if score >= 50: return "low"
+    if score >= 22: return "very_low"
     return "night"
 
 
@@ -427,12 +446,26 @@ class _TemporalBlender:
         return np.clip(blended, 0, 255).astype(np.uint8)
 
 
-# ── Adaptive CLAHE ────────────────────────────────────────────────────────────
-# Three presets matched to the lighting tiers:
-#   normal   — mild contrast lift, preserves natural look
-#   low      — stronger lift, smaller tiles for local adaptation
-#   night    — aggressive lift with very small tiles for micro-contrast recovery
+# ── Reinhard tone mapping ─────────────────────────────────────────────────────
+# Critical for backlit / HDR scenes (e.g. dark room + bright doorway).
+# Standard gamma lifts shadows but simultaneously saturates highlights.
+# Reinhard compresses the log-luminance globally: bright areas are pulled
+# down, dark areas are pulled up — both in the same pass.
+# light_adapt=0.8 → strong local adaptation (each region normalised separately)
+# This is the correct operator for CCTV footage where the camera AGC hasn't
+# balanced the exposure between dark interior and bright exits/windows.
 
+_TONEMAP = cv2.createTonemapReinhard(
+    gamma=1.0, intensity=0.0, light_adapt=0.8, color_adapt=0.0)
+
+def _tone_map(img: np.ndarray) -> np.ndarray:
+    """Reinhard tone mapping: handles bright-door + dark-room HDR."""
+    f   = img.astype(np.float32) / 255.0
+    out = _TONEMAP.process(f)
+    return np.clip(out * 255, 0, 255).astype(np.uint8)
+
+
+# ── Adaptive CLAHE ────────────────────────────────────────────────────────────
 _CLAHE_NORMAL = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 _CLAHE_LOW    = cv2.createCLAHE(clipLimit=3.5, tileGridSize=(8, 8))
 _CLAHE_NIGHT  = cv2.createCLAHE(clipLimit=6.0, tileGridSize=(4, 4))
@@ -440,15 +473,18 @@ _CLAHE_NIGHT  = cv2.createCLAHE(clipLimit=6.0, tileGridSize=(4, 4))
 
 # ── Master enhancement pipeline ───────────────────────────────────────────────
 # Called on every tile and on the full frame before SAM3.
-# Unsharp masking is intentionally omitted — it adds ringing artifacts that
-# break SAM3's text-visual similarity scoring for surgical caps and gloves.
+# Unsharp masking is intentionally omitted — ringing artifacts break SAM3's
+# text-visual similarity scoring for surgical caps and gloves.
 #
 # Pipeline per level:
-#   normal   → CLAHE only (unchanged from original)
-#   low      → gamma lift → stronger CLAHE
-#   very_low → denoise → white balance → gamma lift → aggressive CLAHE
-#   night    → denoise → MSRCR (removes illumination) → white balance
-#              → gamma lift → aggressive CLAHE
+#   normal   → CLAHE only (unchanged from original — no regression)
+#   low      → tone_map → gamma → stronger CLAHE
+#   very_low → denoise → tone_map → white_balance → gamma → aggressive CLAHE
+#   night    → denoise → MSRCR → tone_map → white_balance → gamma → aggressive CLAHE
+#
+# Tone mapping is added to ALL non-normal levels because factory CCTV footage
+# almost always has HDR situations (windows, lamps, exit signs) that pure
+# gamma cannot handle.  MSRCR is reserved for near-total darkness only.
 
 def _enhance(img: np.ndarray, level: str = "normal") -> np.ndarray:
     if img.shape[0] < 8 or img.shape[1] < 8:
@@ -461,7 +497,8 @@ def _enhance(img: np.ndarray, level: str = "normal") -> np.ndarray:
         return cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
 
     elif level == "low":
-        img     = _auto_gamma(img, target=105.0)
+        img     = _tone_map(img)            # compress highlights, lift shadows
+        img     = _auto_gamma(img, target=108.0)
         lab     = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(lab)
         l       = _CLAHE_LOW.apply(l)
@@ -469,8 +506,9 @@ def _enhance(img: np.ndarray, level: str = "normal") -> np.ndarray:
 
     elif level == "very_low":
         img     = _denoise(img, strength=6)
+        img     = _tone_map(img)
         img     = _white_balance(img)
-        img     = _auto_gamma(img, target=112.0)
+        img     = _auto_gamma(img, target=115.0)
         lab     = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(lab)
         l       = _CLAHE_NIGHT.apply(l)
@@ -479,6 +517,7 @@ def _enhance(img: np.ndarray, level: str = "normal") -> np.ndarray:
     else:  # night
         img     = _denoise(img, strength=9)
         img     = _msrcr(img)               # Retinex: strip illumination, keep reflectance
+        img     = _tone_map(img)            # flatten remaining HDR
         img     = _white_balance(img)
         img     = _auto_gamma(img, target=120.0)
         lab     = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
@@ -497,7 +536,7 @@ def _enhance(img: np.ndarray, level: str = "normal") -> np.ndarray:
 # false positives to suppress real detections via IoU overlap.
 
 # Scale factors per lighting level: user conf × factor = actual threshold used
-_CONF_SCALE = {"normal": 1.00, "low": 0.80, "very_low": 0.60, "night": 0.45}
+_CONF_SCALE = {"normal": 1.00, "low": 0.70, "very_low": 0.55, "night": 0.40}
 
 
 def _set_predictor_conf(predictor, conf: float):
@@ -581,6 +620,13 @@ def _infer_full_frame(frame: np.ndarray, predictor,
     try:
         predictor.set_image(pil)
         results = predictor(text=labels)
+    except torch.cuda.OutOfMemoryError:
+        # OOM on full-frame is non-fatal — SAHI tiles already covered the frame.
+        # Free cache so subsequent passes are not also affected.
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        print("[full] OOM — skipped (SAHI tiles still used)")
+        return sv.Detections.empty()
     except Exception as exc:
         print(f"[full] error: {exc}")
         return sv.Detections.empty()
@@ -621,9 +667,12 @@ def detection_loop(sess: dict, confidence: float, every_n: int):
 
     # ── Load SAM3 (one instance per session) ──────────────────────────────────
     print(f"[sam3][{sid[:8]}] loading model...")
+    # imgsz=896 = 14×64 — exact multiple of SAM3's stride (avoids rounding
+    # warning) and uses ~50% less VRAM than 1280 on full-frame inference while
+    # still resolving objects in each SAHI tile at adequate resolution.
     overrides = dict(
         conf=confidence, task="segment", mode="predict",
-        model=MODEL_PATH, half=True, imgsz=1280, verbose=False,
+        model=MODEL_PATH, half=True, imgsz=896, verbose=False,
     )
     predictor = SAM3SemanticPredictor(overrides=overrides)
     print(f"[sam3][{sid[:8]}] model loaded  (conf={confidence:.2f})")
@@ -753,25 +802,34 @@ def detection_loop(sess: dict, confidence: float, every_n: int):
                         class_id=sahi_dets.class_id,
                     )
 
+                # Free VRAM fragments before full-frame inference
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
                 # ── 7. Full-frame pass on original ────────────────────────────
                 full_dets = _infer_full_frame(f_proc, predictor, labels, level)
 
-                # ── 8. TTA: horizontal flip ───────────────────────────────────
-                # Adds one extra SAM3 call for low/dark frames.  Objects near
-                # tile boundaries or with asymmetric shadows become detectable
-                # from the mirrored view.
+                # ── 8. TTA: horizontal flip (skipped on OOM) ──────────────────
                 if level in ("low", "very_low", "night"):
-                    fw_  = f_proc.shape[1]
-                    f_fl = cv2.flip(f_proc, 1)
-                    fl_dets = _infer_full_frame(f_fl, predictor, labels, level)
-                    if len(fl_dets) > 0:
-                        xyxy_fl = fl_dets.xyxy.copy()
-                        xyxy_fl[:, [0, 2]] = fw_ - xyxy_fl[:, [2, 0]]
-                        fl_dets = sv.Detections(
-                            xyxy=xyxy_fl,
-                            confidence=fl_dets.confidence,
-                            class_id=fl_dets.class_id,
-                        )
+                    try:
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        fw_  = f_proc.shape[1]
+                        f_fl = cv2.flip(f_proc, 1)
+                        fl_dets = _infer_full_frame(f_fl, predictor, labels, level)
+                        if len(fl_dets) > 0:
+                            xyxy_fl = fl_dets.xyxy.copy()
+                            xyxy_fl[:, [0, 2]] = fw_ - xyxy_fl[:, [2, 0]]
+                            fl_dets = sv.Detections(
+                                xyxy=xyxy_fl,
+                                confidence=fl_dets.confidence,
+                                class_id=fl_dets.class_id,
+                            )
+                    except torch.cuda.OutOfMemoryError:
+                        print(f"[infer][{sid[:8]}] TTA skipped — OOM")
+                        fl_dets = sv.Detections.empty()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
                 else:
                     fl_dets = sv.Detections.empty()
 
