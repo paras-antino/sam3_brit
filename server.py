@@ -18,12 +18,18 @@ from PIL import Image as PILImage
 from pydantic import BaseModel
 import supervision as sv
 from supervision import ByteTrack
+from ultralytics import YOLO
 from ultralytics.models.sam import SAM3SemanticPredictor
 
 # ── Config ────────────────────────────────────────────────────────────────────
 MODEL_PATH = "/home/paras/sam3/sam3.pt"
 OUTPUT_DIR = "/home/paras/sam3/outputs"
 MAX_FRAMES = None
+
+# YOLO model for person detection.
+# ultralytics auto-downloads this on first use (~22 MB).
+# Upgrade to "yolov8m.pt" or "yolov8l.pt" for better small-object recall.
+YOLO_MODEL = "yolov8s.pt"
 
 # Head crops only for persons whose bbox height is >= this many pixels.
 # Below this the person is too far and the full-frame tile result is used instead.
@@ -280,15 +286,87 @@ def _run_sahi(frame: np.ndarray, predictor: SAM3SemanticPredictor,
     return merged.with_nms(threshold=0.45)
 
 
+def _run_yolo_sahi(frame: np.ndarray, yolo_model,
+                   n_cols: int, n_rows: int,
+                   overlap: float = 0.20,
+                   person_label_idx: int = 0) -> sv.Detections:
+    """
+    YOLO-based person detection with SAHI tiling.
+
+    Why YOLO instead of SAM3 text for persons:
+      SAM3 text-prompted detection is general-purpose and struggles with
+      small/moving persons at distance.  YOLO is trained on 118k COCO images
+      specifically for object detection — person recall at small scale is
+      dramatically better.  SAM3 is kept only for cap segmentation where
+      its open-vocabulary text understanding is genuinely needed.
+
+    Returns sv.Detections where every box has class_id = person_label_idx.
+    """
+    fh, fw = frame.shape[:2]
+    tile_w   = int(fw / (n_cols - overlap * (n_cols - 1)))
+    tile_h   = int(fh / (n_rows - overlap * (n_rows - 1)))
+    stride_x = int(tile_w * (1 - overlap))
+    stride_y = int(tile_h * (1 - overlap))
+
+    all_boxes, all_confs = [], []
+
+    for row in range(n_rows):
+        for col in range(n_cols):
+            x1 = col * stride_x
+            y1 = row * stride_y
+            x2 = min(x1 + tile_w, fw)
+            y2 = min(y1 + tile_h, fh)
+            tile = frame[y1:y2, x1:x2]
+            if tile.size == 0:
+                continue
+
+            tile = _enhance(tile)   # same CLAHE + unsharp pass
+
+            try:
+                res = yolo_model(tile, verbose=False, classes=[0])   # 0 = person in COCO
+            except Exception as exc:
+                print(f"[yolo] tile({row},{col}) error: {exc}")
+                continue
+
+            if res and res[0].boxes is not None and len(res[0].boxes):
+                boxes = res[0].boxes.xyxy.cpu().numpy().copy()
+                boxes[:, [0, 2]] += x1
+                boxes[:, [1, 3]] += y1
+                boxes[:, [0, 2]]  = np.clip(boxes[:, [0, 2]], 0, fw)
+                boxes[:, [1, 3]]  = np.clip(boxes[:, [1, 3]], 0, fh)
+                all_boxes.append(boxes)
+                all_confs.append(res[0].boxes.conf.cpu().numpy())
+
+    if not all_boxes:
+        return sv.Detections.empty()
+
+    boxes_np = np.vstack(all_boxes)
+    merged   = sv.Detections(
+        xyxy=boxes_np,
+        confidence=np.hstack(all_confs),
+        class_id=np.full(len(boxes_np), person_label_idx, dtype=int),
+    )
+    return merged.with_nms(threshold=0.45)
+
+
 def _run_head_crops(frame: np.ndarray, dets: sv.Detections,
                     crop_predictor: SAM3SemanticPredictor,
                     labels: list, cap_label: str,
                     width: int, height: int) -> list:
     """
-    For each detected person, run a dedicated SAM3 inference on just their
-    head region (top 38% of bbox).  Returns list of (center, has_cap, is_close).
-    For distant persons (bbox height < MIN_CROP_PERSON_HEIGHT) has_cap=None,
-    meaning "use full-frame detection result instead".
+    For each detected person (from YOLO), run SAM3 on just their head region
+    (top 38% of bbox) to check for a cap.
+
+    SAM3 is called with both a text prompt AND a bounding box covering the
+    full head crop.  This box-prompted mode is significantly more accurate
+    than a plain text scan of the whole frame because:
+      1. The image SAM3 sees IS already the tight head crop.
+      2. The box [0, 0, w, h] tells SAM3's mask decoder to focus on the
+         entire crop rather than hunting for the object globally.
+
+    Returns list of (center, has_cap, is_close):
+      has_cap = True/False for close workers, None for distant workers
+                (distant workers fall back to bbox-overlap check).
     """
     result = []
     if not cap_label or crop_predictor is None or dets is None or len(dets) == 0:
@@ -310,14 +388,28 @@ def _run_head_crops(frame: np.ndarray, dets: sv.Detections,
             cx1, cy1 = max(0, px1), max(0, py1)
             cx2, cy2 = min(width, px2), min(height, py1 + head_h)
             has_cap  = False
-            if (cx2 - cx1) >= 10 and (cy2 - cy1) >= 10:
+            crop_w   = cx2 - cx1
+            crop_h   = cy2 - cy1
+            if crop_w >= 10 and crop_h >= 10:
                 try:
-                    head_crop = _enhance(frame[cy1:cy2, cx1:cx2])
-                    crop_predictor.set_image(PILImage.fromarray(
-                        cv2.cvtColor(head_crop, cv2.COLOR_BGR2RGB)))
-                    crop_res = crop_predictor(text=[cap_label])
-                    has_cap  = bool(crop_res and crop_res[0].boxes is not None
-                                    and len(crop_res[0].boxes) > 0)
+                    head_crop     = _enhance(frame[cy1:cy2, cx1:cx2])
+                    head_crop_pil = PILImage.fromarray(
+                        cv2.cvtColor(head_crop, cv2.COLOR_BGR2RGB))
+                    crop_predictor.set_image(head_crop_pil)
+
+                    # Prefer box-prompted + text (SAM3 box API).
+                    # If the predictor version doesn't accept bboxes kwarg,
+                    # fall back to text-only on the already-cropped image.
+                    try:
+                        crop_res = crop_predictor(
+                            text=[cap_label],
+                            bboxes=[[0, 0, crop_w, crop_h]],
+                        )
+                    except TypeError:
+                        crop_res = crop_predictor(text=[cap_label])
+
+                    has_cap = bool(crop_res and crop_res[0].boxes is not None
+                                   and len(crop_res[0].boxes) > 0)
                 except Exception as exc:
                     print(f"[crop] error: {exc}")
             result.append((_box_center(box), has_cap, True))
@@ -436,25 +528,41 @@ def detection_loop(rtsp_url: str, labels: list, confidence: float,
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     cap_mode = bool(cap_label)
 
-    # ── Predictors ────────────────────────────────────────────────────────────
-    # Full-frame / tile predictor: imgsz=1024 gives the best balance between
-    # resolution and speed.  With SAHI each tile is processed at this resolution
-    # independently, so distant small objects get near-native pixel coverage.
-    print("[sam3] loading tile predictor (imgsz=1024)...")
-    predictor = SAM3SemanticPredictor(overrides=dict(
-        conf=confidence, task="segment", mode="predict",
-        model=MODEL_PATH, half=True, imgsz=1024, verbose=False,
-    ))
+    # ── Models ────────────────────────────────────────────────────────────────
+    #
+    # Person detection  → YOLO (COCO-trained, purpose-built for this task).
+    #   YOLO is dramatically better than SAM3 text-prompting for locating
+    #   persons: it was trained on 118k images with explicit person labels,
+    #   handles motion/distance well, and runs ~10× faster per frame.
+    #
+    # Cap detection     → SAM3 (open-vocabulary semantic segmentation).
+    #   SAM3 is kept for cap detection because there is no COCO class for
+    #   "transparent safety cap". Its text-understanding allows zero-shot
+    #   detection of objects YOLO has never been trained on.  It runs only
+    #   on the tight head crop, not the whole frame.
+    #
+    print(f"[yolo] loading {YOLO_MODEL} for person detection…")
+    yolo_model = YOLO(YOLO_MODEL)
+    # Warm up so first-frame latency doesn't spike
+    _dummy = np.zeros((64, 64, 3), dtype=np.uint8)
+    yolo_model(_dummy, verbose=False)
+    print("[yolo] ready")
+
+    # Ensure "person" is always at index 0 in the labels list so class_id=0
+    # (what YOLO returns for persons) maps correctly in the compliance check.
+    if "person" not in labels:
+        labels = ["person"] + labels
+    person_label_idx = labels.index("person")
 
     crop_predictor = None
     if cap_mode:
         crop_conf = max(confidence * 0.65, 0.15)
-        print(f"[sam3] loading head-crop predictor (imgsz=384, conf={crop_conf:.2f})...")
+        print(f"[sam3] loading head-crop predictor (imgsz=384, conf={crop_conf:.2f})…")
         crop_predictor = SAM3SemanticPredictor(overrides=dict(
             conf=crop_conf, task="segment", mode="predict",
             model=MODEL_PATH, half=True, imgsz=384, verbose=False,
         ))
-    print("[sam3] predictors ready")
+    print("[sam3] cap predictor ready")
 
     # ── Real-ESRGAN (optional) ─────────────────────────────────────────────────
     # Load once here so the weight file is downloaded before the stream starts.
@@ -504,10 +612,10 @@ def detection_loop(rtsp_url: str, labels: list, confidence: float,
             color=sv.ColorPalette.from_hex(["#00C864"]), text_color=sv.Color.BLACK)
 
     # ── Async inference thread ─────────────────────────────────────────────────
-    # SAM3 + SAHI can take 400-800 ms per inference event.  Running it in a
-    # background thread keeps the annotation loop (and browser stream) smooth —
-    # ByteTrack always has the latest available detections while the next
-    # inference finishes in the background.
+    # YOLO person detection runs fast (~20-50 ms), but SAM3 cap detection on
+    # head crops can take 200-500 ms.  Running everything in a background
+    # thread keeps the annotation loop (and browser stream) smooth at full FPS
+    # while ByteTrack uses the latest available detections.
     infer: dict = {
         "running":   True,
         "frame":     None,
@@ -529,27 +637,29 @@ def detection_loop(rtsp_url: str, labels: list, confidence: float,
                 continue
             t0 = time.time()
 
-            # ── Optional Real-ESRGAN upscale ──────────────────────────────────
-            # Upscale the full frame ONCE before SAHI so every tile benefits
-            # from synthesised detail.  Detection boxes are then scaled back to
-            # original-frame coordinates before ByteTrack sees them.
+            # ── YOLO person detection (with optional SR pre-pass) ─────────────
+            # If Real-ESRGAN is available, upscale once so YOLO sees a 2×
+            # resolution frame; boxes are scaled back to original coords.
             if upsampler is not None:
                 t_sr = time.time()
                 f_sr = _apply_sr(f, upsampler)
                 sr_h, sr_w = f_sr.shape[:2]
-                sx = f.shape[1] / sr_w   # scale factor back to original
+                sx = f.shape[1] / sr_w
                 sy = f.shape[0] / sr_h
                 print(f"[esrgan] {f.shape[1]}x{f.shape[0]} → {sr_w}x{sr_h}  "
                       f"{(time.time()-t_sr)*1000:.0f} ms")
-                # Adjust tile-count for the larger SR frame
                 sr_n_cols = 3 if sr_w > 2560 else 2
                 sr_n_rows = 3 if sr_h > 1440 else 2
-                dets  = _run_sahi(f_sr, predictor, labels, sr_n_cols, sr_n_rows)
-                dets  = _scale_detections(dets, sx, sy)
-                hcaps = _run_head_crops(f, dets, crop_predictor, labels, cap_label, width, height)
+                dets = _run_yolo_sahi(f_sr, yolo_model, sr_n_cols, sr_n_rows,
+                                      person_label_idx=person_label_idx)
+                dets = _scale_detections(dets, sx, sy)
             else:
-                dets  = _run_sahi(f, predictor, labels, n_cols, n_rows)
-                hcaps = _run_head_crops(f, dets, crop_predictor, labels, cap_label, width, height)
+                dets = _run_yolo_sahi(f, yolo_model, n_cols, n_rows,
+                                      person_label_idx=person_label_idx)
+
+            # ── SAM3 cap detection on head crops ──────────────────────────────
+            hcaps = _run_head_crops(f, dets, crop_predictor, labels,
+                                    cap_label, width, height)
 
             print(f"[infer] {len(dets)} dets  {len(hcaps)} crops  "
                   f"{(time.time()-t0)*1000:.0f} ms")
