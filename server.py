@@ -215,8 +215,14 @@ def cleanup_loop():
 # Auto-download: RealESRGAN_x2plus.pth (~67 MB) is fetched from GitHub on
 # first use and saved next to sam3.pt.
 
-def _load_realesrgan(model_dir: str, scale: int = 2):
-    """Returns (upsampler, scale) or (None, 1) if unavailable."""
+def _load_realesrgan(model_dir: str):
+    """
+    Load RealESRGAN_x4plus — the largest general-purpose SR model.
+    We use the x4 model but request outscale=2 in _apply_sr, which gives
+    richer synthesised detail than the native x2 model at the same output size.
+    With 16 GB VRAM the x4 model fits entirely on-GPU with no memory pressure.
+    Returns (upsampler, outscale) or (None, 1) if the package is absent.
+    """
     try:
         from realesrgan import RealESRGANer
         from basicsr.archs.rrdbnet_arch import RRDBNet
@@ -225,13 +231,14 @@ def _load_realesrgan(model_dir: str, scale: int = 2):
               "Install with: pip install realesrgan basicsr")
         return None, 1
 
-    weight_name = f"RealESRGAN_x{scale}plus.pth"
+    weight_name = "RealESRGAN_x4plus.pth"
     weight_path = os.path.join(model_dir, weight_name)
 
     if not os.path.exists(weight_path):
-        url = (f"https://github.com/xinntao/Real-ESRGAN/releases/download/"
-               f"v0.2.1/{weight_name}")
-        print(f"[esrgan] downloading {weight_name}…")
+        # x4plus weights live under the v0.1.0 release tag
+        url = ("https://github.com/xinntao/Real-ESRGAN/releases/download/"
+               f"v0.1.0/{weight_name}")
+        print(f"[esrgan] downloading {weight_name} (~67 MB)…")
         try:
             import urllib.request
             os.makedirs(model_dir, exist_ok=True)
@@ -244,25 +251,33 @@ def _load_realesrgan(model_dir: str, scale: int = 2):
     try:
         arch = RRDBNet(num_in_ch=3, num_out_ch=3,
                        num_feat=64, num_block=23,
-                       num_grow_ch=32, scale=scale)
+                       num_grow_ch=32, scale=4)
         up   = RealESRGANer(
-            scale=scale, model_path=weight_path, model=arch,
-            tile=256, tile_pad=10, pre_pad=0,
-            half=torch.cuda.is_available(),
+            scale=4,
+            model_path=weight_path,
+            model=arch,
+            tile=512,       # large tile — 16 GB VRAM handles this comfortably
+            tile_pad=16,
+            pre_pad=0,
+            half=True,      # fp16 is fine on RTX 5060, halves VRAM & speeds up
             device="cuda" if torch.cuda.is_available() else "cpu",
         )
-        print(f"[esrgan] RealESRGAN_x{scale}plus ready")
-        return up, scale
+        print("[esrgan] RealESRGAN_x4plus ready (outscale=2, tile=512, fp16)")
+        return up, 2       # outscale=2: x4 model → 2× output (best quality at 2×)
     except Exception as exc:
         print(f"[esrgan] init failed: {exc} — SR disabled")
         return None, 1
 
 
-def _apply_sr(frame: np.ndarray, upsampler) -> np.ndarray:
-    """Upscale BGR frame with Real-ESRGAN. Falls back to original on error."""
+def _apply_sr(frame: np.ndarray, upsampler, outscale: int = 2) -> np.ndarray:
+    """
+    Upscale frame with Real-ESRGAN x4plus, output at outscale× size.
+    Using the x4 model with outscale=2 produces cleaner 2× results than
+    the native x2 model because the larger network captures more texture.
+    """
     try:
         out_rgb, _ = upsampler.enhance(
-            cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), outscale=None)
+            cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), outscale=outscale)
         return cv2.cvtColor(out_rgb, cv2.COLOR_RGB2BGR)
     except Exception as exc:
         print(f"[esrgan] enhance error: {exc}")
@@ -283,7 +298,7 @@ def _scale_boxes(xyxy: np.ndarray, sx: float, sy: float) -> np.ndarray:
 #    boundaries become visible without blowing out highlights elsewhere.
 # 2. Unsharp mask — sharpens edges so small distant objects have crisp borders.
 
-_CLAHE = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+_CLAHE = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(16, 16))
 
 
 def _enhance(img: np.ndarray) -> np.ndarray:
@@ -361,13 +376,13 @@ def detection_loop(rtsp_url: str, labels: list, confidence: float,
     print("[sam3] loading model...")
     overrides = dict(
         conf=confidence, task="segment", mode="predict",
-        model=MODEL_PATH, half=True, imgsz=1024, verbose=False,
+        model=MODEL_PATH, half=True, imgsz=1280, verbose=False,
     )
     predictor = SAM3SemanticPredictor(overrides=overrides)
     print("[sam3] model loaded")
 
-    # Optional Real-ESRGAN upsampler — loaded once, used every inference frame
-    upsampler, _sr_scale = _load_realesrgan(os.path.dirname(MODEL_PATH), scale=2)
+    # Real-ESRGAN x4plus — loaded once, applied every inference cycle
+    upsampler, sr_outscale = _load_realesrgan(os.path.dirname(MODEL_PATH))
 
     # ── Tracker + annotators ──────────────────────────────────────────────────
     tracker   = ByteTrack(track_activation_threshold=0.25, lost_track_buffer=30,
@@ -392,10 +407,11 @@ def detection_loop(rtsp_url: str, labels: list, confidence: float,
     height     = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     print(f"[rtsp] {width}x{height} @ {stream_fps:.1f} fps")
 
-    # 2×2 tiles for ≤1080p, 3×3 for 4K — each tile is processed independently
-    n_cols = 3 if width  > 2560 else 2
-    n_rows = 3 if height > 1440 else 2
-    print(f"[sahi] {n_cols}×{n_rows} tile grid")
+    # Always 3×3 tiles — with 16 GB VRAM and imgsz=1280, the GPU handles
+    # 9 tiles comfortably.  3×3 gives ~1.7× more pixels per object vs 2×2,
+    # which is the single biggest boost for small/distant objects.
+    n_cols, n_rows = 3, 3
+    print(f"[sahi] {n_cols}×{n_rows} tile grid (fixed)")
 
     # ── Open writers if requested at start ────────────────────────────────────
     if save_on_start:
@@ -430,13 +446,11 @@ def detection_loop(rtsp_url: str, labels: list, confidence: float,
             try:
                 # Optional SR upscale before SAHI
                 if upsampler is not None:
-                    f_sr   = _apply_sr(f, upsampler)
+                    f_sr   = _apply_sr(f, upsampler, outscale=sr_outscale)
                     sr_h, sr_w = f_sr.shape[:2]
                     sx = f.shape[1] / sr_w
                     sy = f.shape[0] / sr_h
-                    nc = 3 if sr_w > 2560 else 2
-                    nr = 3 if sr_h > 1440 else 2
-                    dets = _run_sahi(f_sr, predictor, labels, nc, nr)
+                    dets = _run_sahi(f_sr, predictor, labels, n_cols, n_rows)
                     if len(dets) > 0:
                         dets = sv.Detections(
                             xyxy=_scale_boxes(dets.xyxy, sx, sy),
