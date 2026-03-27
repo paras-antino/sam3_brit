@@ -109,6 +109,104 @@ def _enhance(img: np.ndarray) -> np.ndarray:
     return out
 
 
+# ── Real-ESRGAN super-resolution (optional quality layer) ────────────────────
+#
+# When the `realesrgan` package is installed and model weights are available,
+# the full frame is upscaled 2× by RealESRGAN_x2plus before SAHI runs.
+# This synthesises genuine detail (not just bicubic interpolation), which
+# makes transparent-cap boundaries visible even at 50 m distance.
+#
+# Graceful fallback: if the package / weights are absent the code continues
+# with CLAHE + unsharp masking only (no crash, just a one-time warning).
+#
+# Auto-download: on first use the ~67 MB RealESRGAN_x2plus.pth weights are
+# downloaded from GitHub releases into MODEL_PATH's directory.
+
+def _load_realesrgan(model_dir: str, scale: int = 2):
+    """
+    Load a RealESRGAN upsampler.  Returns (upsampler, scale) on success,
+    or (None, 1) if the package / CUDA is unavailable.
+    """
+    try:
+        from realesrgan import RealESRGANer
+        from basicsr.archs.rrdbnet_arch import RRDBNet
+    except ImportError:
+        print("[esrgan] `realesrgan` package not found — SR disabled. "
+              "Install with: pip install realesrgan basicsr")
+        return None, 1
+
+    weight_name = f"RealESRGAN_x{scale}plus.pth"
+    weight_path = os.path.join(model_dir, weight_name)
+
+    if not os.path.exists(weight_path):
+        url = (f"https://github.com/xinntao/Real-ESRGAN/releases/download/"
+               f"v0.2.1/{weight_name}")
+        print(f"[esrgan] downloading {weight_name} from GitHub releases…")
+        try:
+            import urllib.request
+            os.makedirs(model_dir, exist_ok=True)
+            urllib.request.urlretrieve(url, weight_path)
+            print(f"[esrgan] saved to {weight_path}")
+        except Exception as exc:
+            print(f"[esrgan] download failed: {exc}  — SR disabled")
+            return None, 1
+
+    try:
+        num_feat   = 64
+        num_block  = 23 if scale == 4 else 23
+        model_arch = RRDBNet(num_in_ch=3, num_out_ch=3,
+                             num_feat=num_feat, num_block=num_block,
+                             num_grow_ch=32, scale=scale)
+        upsampler  = RealESRGANer(
+            scale=scale,
+            model_path=weight_path,
+            model=model_arch,
+            tile=256,            # tile-based SR so VRAM stays bounded
+            tile_pad=10,
+            pre_pad=0,
+            half=torch.cuda.is_available(),
+            device="cuda" if torch.cuda.is_available() else "cpu",
+        )
+        print(f"[esrgan] RealESRGAN_x{scale}plus ready  "
+              f"(device={'cuda' if torch.cuda.is_available() else 'cpu'})")
+        return upsampler, scale
+    except Exception as exc:
+        print(f"[esrgan] init failed: {exc}  — SR disabled")
+        return None, 1
+
+
+def _apply_sr(frame: np.ndarray, upsampler) -> np.ndarray:
+    """
+    Run Real-ESRGAN on `frame` (BGR).  Returns the upscaled BGR image.
+    Falls back to the original frame on any error.
+    """
+    try:
+        # RealESRGANer expects RGB uint8
+        rgb_in = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        out_rgb, _ = upsampler.enhance(rgb_in, outscale=None)
+        return cv2.cvtColor(out_rgb, cv2.COLOR_RGB2BGR)
+    except Exception as exc:
+        print(f"[esrgan] enhance error: {exc}")
+        return frame
+
+
+def _scale_detections(dets: sv.Detections, sx: float, sy: float) -> sv.Detections:
+    """
+    Scale detection boxes back from SR-space to original-frame space.
+    sx = orig_w / sr_w,  sy = orig_h / sr_h.
+    """
+    if dets is None or len(dets) == 0:
+        return dets
+    scaled = dets.xyxy.copy()
+    scaled[:, [0, 2]] *= sx
+    scaled[:, [1, 3]] *= sy
+    return sv.Detections(
+        xyxy=scaled,
+        confidence=dets.confidence,
+        class_id=dets.class_id,
+    )
+
+
 # ── SAHI: tiled inference ─────────────────────────────────────────────────────
 
 def _run_sahi(frame: np.ndarray, predictor: SAM3SemanticPredictor,
@@ -358,6 +456,12 @@ def detection_loop(rtsp_url: str, labels: list, confidence: float,
         ))
     print("[sam3] predictors ready")
 
+    # ── Real-ESRGAN (optional) ─────────────────────────────────────────────────
+    # Load once here so the weight file is downloaded before the stream starts.
+    # upsampler=None means SR is unavailable; code falls back transparently.
+    sr_model_dir = os.path.dirname(MODEL_PATH)
+    upsampler, sr_scale = _load_realesrgan(sr_model_dir, scale=2)
+
     # ── Open RTSP ─────────────────────────────────────────────────────────────
     print(f"[rtsp] connecting -> {rtsp_url}")
     cap = cv2.VideoCapture(rtsp_url)
@@ -424,8 +528,29 @@ def detection_loop(rtsp_url: str, labels: list, confidence: float,
             if f is None:
                 continue
             t0 = time.time()
-            dets  = _run_sahi(f, predictor, labels, n_cols, n_rows)
-            hcaps = _run_head_crops(f, dets, crop_predictor, labels, cap_label, width, height)
+
+            # ── Optional Real-ESRGAN upscale ──────────────────────────────────
+            # Upscale the full frame ONCE before SAHI so every tile benefits
+            # from synthesised detail.  Detection boxes are then scaled back to
+            # original-frame coordinates before ByteTrack sees them.
+            if upsampler is not None:
+                t_sr = time.time()
+                f_sr = _apply_sr(f, upsampler)
+                sr_h, sr_w = f_sr.shape[:2]
+                sx = f.shape[1] / sr_w   # scale factor back to original
+                sy = f.shape[0] / sr_h
+                print(f"[esrgan] {f.shape[1]}x{f.shape[0]} → {sr_w}x{sr_h}  "
+                      f"{(time.time()-t_sr)*1000:.0f} ms")
+                # Adjust tile-count for the larger SR frame
+                sr_n_cols = 3 if sr_w > 2560 else 2
+                sr_n_rows = 3 if sr_h > 1440 else 2
+                dets  = _run_sahi(f_sr, predictor, labels, sr_n_cols, sr_n_rows)
+                dets  = _scale_detections(dets, sx, sy)
+                hcaps = _run_head_crops(f, dets, crop_predictor, labels, cap_label, width, height)
+            else:
+                dets  = _run_sahi(f, predictor, labels, n_cols, n_rows)
+                hcaps = _run_head_crops(f, dets, crop_predictor, labels, cap_label, width, height)
+
             print(f"[infer] {len(dets)} dets  {len(hcaps)} crops  "
                   f"{(time.time()-t0)*1000:.0f} ms")
             with infer["lock"]:
