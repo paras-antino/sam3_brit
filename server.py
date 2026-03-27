@@ -1,4 +1,5 @@
 import csv
+import math
 import os
 import psutil
 import subprocess
@@ -319,25 +320,196 @@ def _scale_boxes(xyxy: np.ndarray, sx: float, sy: float) -> np.ndarray:
     return out
 
 
-# ── Pre-inference quality enhancement ────────────────────────────────────────
-# CLAHE on the LAB L-channel only — lifts local contrast so faint cap/glove
-# boundaries become visible in low-contrast or distant scenes.
-# Unsharp masking intentionally omitted: it adds ringing artifacts around
-# edges that break SAM3's text-to-visual matching for surgical caps and gloves.
+# ── Lighting analysis ─────────────────────────────────────────────────────────
+# Four lighting tiers drive the entire adaptive pipeline.
+# Thresholds are on mean L* (perceptual luminance, 0-255):
+#   normal   ≥ 100   — daylight / well-lit factory
+#   low      ≥  55   — overcast, dusk, dim artificial light
+#   very_low ≥  25   — very dark room, single lamp, heavy shadow
+#   night    <  25   — near-total darkness, IR cameras, night-shift
 
-_CLAHE = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+def _brightness_level(frame: np.ndarray) -> str:
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    mean = float(gray.mean())
+    if mean >= 100: return "normal"
+    if mean >= 55:  return "low"
+    if mean >= 25:  return "very_low"
+    return "night"
 
 
-def _enhance(img: np.ndarray) -> np.ndarray:
-    lab     = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-    l       = _CLAHE.apply(l)
-    return cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
+# ── Adaptive gamma correction ─────────────────────────────────────────────────
+# Computes the gamma exponent needed to move the mean brightness toward `target`.
+# Applied before Retinex so the network sees a reasonably exposed image.
+
+def _auto_gamma(img: np.ndarray, target: float = 115.0) -> np.ndarray:
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    mean = max(float(gray.mean()), 1.0)
+    if mean >= target:
+        return img
+    gamma     = math.log(target / 255.0) / math.log(mean / 255.0)
+    gamma     = float(np.clip(gamma, 0.25, 5.0))
+    inv_gamma = 1.0 / gamma
+    lut       = np.array([((i / 255.0) ** inv_gamma) * 255
+                           for i in range(256)], dtype=np.uint8)
+    return cv2.LUT(img, lut)
+
+
+# ── Multi-Scale Retinex with Color Restoration (MSRCR) ────────────────────────
+# Decomposes the scene into reflectance (what objects actually look like) and
+# illumination (the lighting itself), then keeps only reflectance.
+# This is the standard technique used in surveillance low-light research.
+# Sigmas [15, 80, 200] cover detail, mid-range, and large-scale illumination.
+
+def _msrcr(img: np.ndarray) -> np.ndarray:
+    sigmas  = [15.0, 80.0, 200.0]
+    img_f   = img.astype(np.float32) + 1.0          # avoid log(0)
+    log_img = np.log(img_f)
+    msr     = np.zeros_like(img_f)
+    for sigma in sigmas:
+        blur = cv2.GaussianBlur(img_f, (0, 0), sigma)
+        msr += log_img - np.log(blur + 1.0)
+    msr /= len(sigmas)
+
+    # Color Restoration: re-introduce local colour balance
+    img_sum    = img_f.sum(axis=2, keepdims=True) + 1e-6
+    color_coef = np.log(125.0 * img_f / img_sum)
+    result     = color_coef * msr
+
+    # Normalize per-channel to 0-255
+    out = np.zeros_like(img, dtype=np.uint8)
+    for c in range(3):
+        ch   = result[:, :, c]
+        lo, hi = ch.min(), ch.max()
+        if hi > lo:
+            ch = (ch - lo) / (hi - lo) * 255.0
+        out[:, :, c] = np.clip(ch, 0, 255).astype(np.uint8)
+    return out
+
+
+# ── Edge-preserving denoising ─────────────────────────────────────────────────
+# Bilateral filter: smooths sensor noise while keeping object edges sharp.
+# Critical for night frames where Real-ESRGAN would otherwise amplify grain.
+
+def _denoise(img: np.ndarray, strength: int = 7) -> np.ndarray:
+    sigma = strength * 6
+    return cv2.bilateralFilter(img, d=7, sigmaColor=sigma, sigmaSpace=sigma)
+
+
+# ── Gray-world white balance ──────────────────────────────────────────────────
+# Corrects colour casts from sodium/LED/fluorescent factory lighting by
+# scaling each channel so the mean of all channels becomes equal.
+
+def _white_balance(img: np.ndarray) -> np.ndarray:
+    f      = img.astype(np.float32)
+    means  = f.mean(axis=(0, 1))           # per-channel mean
+    global_mean = means.mean()
+    scale  = np.where(means > 1.0, global_mean / means, 1.0)
+    f     *= scale[np.newaxis, np.newaxis, :]
+    return np.clip(f, 0, 255).astype(np.uint8)
+
+
+# ── Temporal blending ─────────────────────────────────────────────────────────
+# Averages the last N frames with exponential decay weighting.
+# Reduces temporal shot noise without adding spatial blur.
+# Most effective when the scene is mostly static (factory floor).
+
+class _TemporalBlender:
+    def __init__(self, maxlen: int = 4, decay: float = 0.55):
+        self._buf   = deque(maxlen=maxlen)
+        self._decay = decay
+
+    def update(self, frame: np.ndarray) -> np.ndarray:
+        self._buf.append(frame.astype(np.float32))
+        n       = len(self._buf)
+        weights = [self._decay ** (n - 1 - i) for i in range(n)]
+        total_w = sum(weights)
+        blended = sum(w * f for w, f in zip(weights, self._buf)) / total_w
+        return np.clip(blended, 0, 255).astype(np.uint8)
+
+
+# ── Adaptive CLAHE ────────────────────────────────────────────────────────────
+# Three presets matched to the lighting tiers:
+#   normal   — mild contrast lift, preserves natural look
+#   low      — stronger lift, smaller tiles for local adaptation
+#   night    — aggressive lift with very small tiles for micro-contrast recovery
+
+_CLAHE_NORMAL = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+_CLAHE_LOW    = cv2.createCLAHE(clipLimit=3.5, tileGridSize=(8, 8))
+_CLAHE_NIGHT  = cv2.createCLAHE(clipLimit=6.0, tileGridSize=(4, 4))
+
+
+# ── Master enhancement pipeline ───────────────────────────────────────────────
+# Called on every tile and on the full frame before SAM3.
+# Unsharp masking is intentionally omitted — it adds ringing artifacts that
+# break SAM3's text-visual similarity scoring for surgical caps and gloves.
+#
+# Pipeline per level:
+#   normal   → CLAHE only (unchanged from original)
+#   low      → gamma lift → stronger CLAHE
+#   very_low → denoise → white balance → gamma lift → aggressive CLAHE
+#   night    → denoise → MSRCR (removes illumination) → white balance
+#              → gamma lift → aggressive CLAHE
+
+def _enhance(img: np.ndarray, level: str = "normal") -> np.ndarray:
+    if img.shape[0] < 8 or img.shape[1] < 8:
+        return img
+
+    if level == "normal":
+        lab     = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        l       = _CLAHE_NORMAL.apply(l)
+        return cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
+
+    elif level == "low":
+        img     = _auto_gamma(img, target=105.0)
+        lab     = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        l       = _CLAHE_LOW.apply(l)
+        return cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
+
+    elif level == "very_low":
+        img     = _denoise(img, strength=6)
+        img     = _white_balance(img)
+        img     = _auto_gamma(img, target=112.0)
+        lab     = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        l       = _CLAHE_NIGHT.apply(l)
+        return cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
+
+    else:  # night
+        img     = _denoise(img, strength=9)
+        img     = _msrcr(img)               # Retinex: strip illumination, keep reflectance
+        img     = _white_balance(img)
+        img     = _auto_gamma(img, target=120.0)
+        lab     = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        l       = _CLAHE_NIGHT.apply(l)
+        return cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
+
+
+# ── Post-inference confidence filter ──────────────────────────────────────────
+# The model is loaded with a permissive base threshold so low-light detections
+# (whose text-visual similarity scores are naturally depressed) are not dropped
+# inside the network.  We re-gate here at a brightness-aware threshold.
+
+def _filter_conf(dets: sv.Detections, min_conf: float) -> sv.Detections:
+    if len(dets) == 0:
+        return dets
+    mask = dets.confidence >= min_conf
+    if not mask.any():
+        return sv.Detections.empty()
+    return sv.Detections(
+        xyxy=dets.xyxy[mask],
+        confidence=dets.confidence[mask],
+        class_id=dets.class_id[mask],
+    )
 
 
 # ── SAHI: tiled inference ─────────────────────────────────────────────────────
 def _run_sahi(frame: np.ndarray, predictor, labels: list,
-              n_cols: int, n_rows: int, overlap: float = 0.20) -> sv.Detections:
+              n_cols: int, n_rows: int,
+              overlap: float = 0.20,
+              level: str = "normal") -> sv.Detections:
     if not labels:
         return sv.Detections.empty()
     fh, fw   = frame.shape[:2]
@@ -359,7 +531,7 @@ def _run_sahi(frame: np.ndarray, predictor, labels: list,
             if tile.size == 0 or tile.shape[0] < 32 or tile.shape[1] < 32:
                 continue
 
-            tile = _enhance(tile)
+            tile = _enhance(tile, level)
             pil  = PILImage.fromarray(cv2.cvtColor(tile, cv2.COLOR_BGR2RGB))
             try:
                 predictor.set_image(pil)
@@ -391,12 +563,12 @@ def _run_sahi(frame: np.ndarray, predictor, labels: list,
 
 
 def _infer_full_frame(frame: np.ndarray, predictor,
-                      labels: list) -> sv.Detections:
+                      labels: list, level: str = "normal") -> sv.Detections:
     """Single SAM3 inference on the entire frame — catches objects at tile boundaries."""
     if not labels:
         return sv.Detections.empty()
     pil = PILImage.fromarray(
-        cv2.cvtColor(_enhance(frame), cv2.COLOR_BGR2RGB))
+        cv2.cvtColor(_enhance(frame, level), cv2.COLOR_BGR2RGB))
     try:
         predictor.set_image(pil)
         results = predictor(text=labels)
@@ -439,13 +611,17 @@ def detection_loop(sess: dict, confidence: float, every_n: int):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     # ── Load SAM3 (one instance per session) ──────────────────────────────────
+    # Set a permissive base threshold so the model returns weaker matches that
+    # only appear in low-light conditions.  We re-gate with _filter_conf() below
+    # using a brightness-adaptive threshold so daytime precision is unchanged.
     print(f"[sam3][{sid[:8]}] loading model...")
+    base_conf = max(0.15, confidence * 0.55)
     overrides = dict(
-        conf=confidence, task="segment", mode="predict",
+        conf=base_conf, task="segment", mode="predict",
         model=MODEL_PATH, half=True, imgsz=1280, verbose=False,
     )
     predictor = SAM3SemanticPredictor(overrides=overrides)
-    print(f"[sam3][{sid[:8]}] model loaded")
+    print(f"[sam3][{sid[:8]}] model loaded  (base_conf={base_conf:.2f}, user_conf={confidence:.2f})")
 
     # Shared Real-ESRGAN (lazy init, loaded once for all sessions)
     upsampler, sr_outscale = _get_realesrgan()
@@ -480,8 +656,11 @@ def detection_loop(sess: dict, confidence: float, every_n: int):
         return
     print(f"[rtsp][{sid[:8]}] {width}x{height} @ {stream_fps:.1f} fps")
 
-    n_cols, n_rows = 3, 3
-    print(f"[sahi][{sid[:8]}] {n_cols}×{n_rows} tile grid (fixed)")
+    # Base grid — overridden per-frame in the inference worker based on brightness.
+    # night/very_low → 4×4 (more tiles = higher effective resolution for small objects)
+    # low/normal     → 3×3
+    BASE_GRID = (3, 3)
+    print(f"[sahi][{sid[:8]}] adaptive grid: 3×3 normal / 4×4 dark")
 
     # ── Open writers if save was requested at start ────────────────────────────
     with sess["_lock"]:
@@ -504,6 +683,10 @@ def detection_loop(sess: dict, confidence: float, every_n: int):
         "event":     threading.Event(),
     }
 
+    # Temporal blender: averages the last 4 frames before SR to suppress
+    # sensor noise.  On dark/night frames this dramatically improves SNR.
+    _blender = _TemporalBlender(maxlen=4, decay=0.55)
+
     def _inference_worker():
         while infer["running"]:
             infer["event"].wait(timeout=1.0)
@@ -517,27 +700,90 @@ def detection_loop(sess: dict, confidence: float, every_n: int):
                 continue
             t0 = time.time()
             try:
+                # ── 1. Lighting analysis ───────────────────────────────────────
+                level = _brightness_level(f)
+
+                # ── 2. Temporal blending for noise suppression ─────────────────
+                # More frames blended = more noise reduction but more ghosting.
+                # Only worth it on dark frames; normal frames skip blending.
+                if level in ("very_low", "night"):
+                    f_proc = _blender.update(f)
+                else:
+                    f_proc = f
+
+                # ── 3. Adaptive SAHI grid ──────────────────────────────────────
+                # 4×4 for dark conditions → 16 tiles instead of 9.
+                # A person at 50 m that is ~20px tall in 1080p becomes ~30px per
+                # tile (4×4) vs ~38px (3×3 with SR) — combined with SR still a
+                # major resolution win for small objects.
+                if level in ("very_low", "night"):
+                    n_cols, n_rows = 4, 4
+                else:
+                    n_cols, n_rows = BASE_GRID
+
+                # ── 4. Super-resolution ────────────────────────────────────────
                 if upsampler is not None:
-                    f_sr = _apply_sr(f, upsampler, outscale=sr_outscale)
-                    sx   = f.shape[1] / f_sr.shape[1]
-                    sy   = f.shape[0] / f_sr.shape[0]
-                    sahi_dets = _run_sahi(f_sr, predictor, labels, n_cols, n_rows)
-                    if len(sahi_dets) > 0:
-                        sahi_dets = sv.Detections(
-                            xyxy=_scale_boxes(sahi_dets.xyxy, sx, sy),
-                            confidence=sahi_dets.confidence,
-                            class_id=sahi_dets.class_id,
+                    f_sr = _apply_sr(f_proc, upsampler, outscale=sr_outscale)
+                    sx   = f_proc.shape[1] / f_sr.shape[1]
+                    sy   = f_proc.shape[0] / f_sr.shape[0]
+                else:
+                    f_sr = f_proc
+                    sx   = sy = 1.0
+
+                # ── 5. SAHI on SR frame ────────────────────────────────────────
+                sahi_dets = _run_sahi(f_sr, predictor, labels,
+                                      n_cols, n_rows, level=level)
+                if len(sahi_dets) > 0 and upsampler is not None:
+                    sahi_dets = sv.Detections(
+                        xyxy=_scale_boxes(sahi_dets.xyxy, sx, sy),
+                        confidence=sahi_dets.confidence,
+                        class_id=sahi_dets.class_id,
+                    )
+
+                # ── 6. Full-frame pass on original ────────────────────────────
+                # Catches objects split across tile boundaries.
+                full_dets = _infer_full_frame(f_proc, predictor, labels, level)
+
+                # ── 7. TTA: horizontal flip ───────────────────────────────────
+                # Run on flipped frame and mirror boxes back.  Improves recall
+                # for workers near tile edges and for objects in low-contrast
+                # regions.  Adds one extra SAM3 call (~0.15s) — worth it at
+                # night when recall matters more than latency.
+                if level in ("low", "very_low", "night"):
+                    fw_  = f_proc.shape[1]
+                    f_fl = cv2.flip(f_proc, 1)
+                    fl_dets = _infer_full_frame(f_fl, predictor, labels, level)
+                    if len(fl_dets) > 0:
+                        xyxy_fl = fl_dets.xyxy.copy()
+                        xyxy_fl[:, [0, 2]] = fw_ - xyxy_fl[:, [2, 0]]
+                        fl_dets = sv.Detections(
+                            xyxy=xyxy_fl,
+                            confidence=fl_dets.confidence,
+                            class_id=fl_dets.class_id,
                         )
                 else:
-                    sahi_dets = _run_sahi(f, predictor, labels, n_cols, n_rows)
+                    fl_dets = sv.Detections.empty()
 
-                full_dets = _infer_full_frame(f, predictor, labels)
-                dets = _merge(sahi_dets, full_dets)
-                print(f"[infer][{sid[:8]}] fid={fid} sahi={len(sahi_dets)} "
-                      f"full={len(full_dets)} merged={len(dets)} "
-                      f"{(time.time()-t0)*1000:.0f} ms")
+                # ── 8. Merge all passes ────────────────────────────────────────
+                raw_dets = _merge(sahi_dets, full_dets, fl_dets)
+
+                # ── 9. Adaptive confidence gate ───────────────────────────────
+                # Scale the user's threshold down for dark conditions so weak
+                # matches (whose scores are depressed by poor image quality)
+                # are not silently dropped.
+                conf_map = {"normal": 1.00, "low": 0.80,
+                            "very_low": 0.65, "night": 0.50}
+                eff_conf = confidence * conf_map[level]
+                dets     = _filter_conf(raw_dets, eff_conf)
+
+                print(f"[infer][{sid[:8]}] fid={fid} level={level} "
+                      f"grid={n_cols}×{n_rows} sahi={len(sahi_dets)} "
+                      f"full={len(full_dets)} flip={len(fl_dets)} "
+                      f"raw={len(raw_dets)} final={len(dets)} "
+                      f"conf≥{eff_conf:.2f}  {(time.time()-t0)*1000:.0f} ms")
             except Exception as exc:
                 print(f"[infer][{sid[:8]}] error: {exc}")
+                import traceback; traceback.print_exc()
                 dets = sv.Detections.empty()
 
             with det_store_lock:
