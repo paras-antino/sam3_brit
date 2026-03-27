@@ -15,51 +15,37 @@
   header h1 { color: #00c864; font-size: 1.1rem; letter-spacing: 3px; }
   header span { color: #333; font-size: 0.72rem; }
 
-  /* Tabs */
-  .tabs {
-    display: flex; gap: 0;
-    border-bottom: 1px solid #1e1e1e;
-    background: #0d0d0d;
-    padding: 0 24px;
-  }
+  .tabs { display: flex; border-bottom: 1px solid #1e1e1e; background: #0d0d0d; padding: 0 24px; }
   .tab {
-    padding: 12px 24px; font-size: 0.72rem; letter-spacing: 1px;
-    text-transform: uppercase; cursor: pointer; color: #444;
-    border-bottom: 2px solid transparent; transition: all 0.2s;
+    padding: 12px 24px; font-size: 0.72rem; letter-spacing: 1px; text-transform: uppercase;
+    cursor: pointer; color: #444; border-bottom: 2px solid transparent;
     background: none; border-top: none; border-left: none; border-right: none;
-    font-family: inherit;
+    font-family: inherit; transition: all 0.2s;
   }
   .tab:hover { color: #888; }
   .tab.active { color: #00c864; border-bottom-color: #00c864; }
-
-  /* Pages */
   .page { display: none; }
   .page.active { display: block; }
 
-  /* ── Live page layout ── */
   .layout {
-    max-width: 1400px; margin: 0 auto; padding: 24px;
-    display: grid;
-    grid-template-columns: 300px 1fr 220px;
-    gap: 20px; align-items: start;
+    max-width: 1500px; margin: 0 auto; padding: 24px;
+    display: grid; grid-template-columns: 280px 1fr 220px; gap: 20px; align-items: start;
   }
 
   .panel {
-    background: #111; border: 1px solid #1e1e1e;
-    border-radius: 8px; padding: 20px;
-    display: flex; flex-direction: column; gap: 16px;
+    background: #111; border: 1px solid #1e1e1e; border-radius: 8px;
+    padding: 20px; display: flex; flex-direction: column; gap: 16px;
   }
   .panel-title {
-    font-size: 0.65rem; letter-spacing: 2px; color: #444;
-    text-transform: uppercase; padding-bottom: 12px;
-    border-bottom: 1px solid #1a1a1a;
+    font-size: 0.65rem; letter-spacing: 2px; color: #444; text-transform: uppercase;
+    padding-bottom: 12px; border-bottom: 1px solid #1a1a1a;
   }
 
   label { display: block; font-size: 0.68rem; color: #555; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 5px; }
   input[type="text"] {
-    width: 100%; background: #0d0d0d; border: 1px solid #2a2a2a;
-    border-radius: 4px; color: #e0e0e0; font-family: inherit;
-    font-size: 0.82rem; padding: 9px 11px; outline: none; transition: border-color 0.2s;
+    width: 100%; background: #0d0d0d; border: 1px solid #2a2a2a; border-radius: 4px;
+    color: #e0e0e0; font-family: inherit; font-size: 0.82rem; padding: 9px 11px;
+    outline: none; transition: border-color 0.2s;
   }
   input[type="text"]:focus { border-color: #00c864; }
 
@@ -82,14 +68,11 @@
   }
   .hint { font-size: 0.65rem; color: #2a2a2a; margin-top: 3px; }
 
-  /* Cap mode section */
   .cap-mode-section {
     background: #0d0d10; border: 1px solid #2a2a3a; border-radius: 6px;
     padding: 12px; display: flex; flex-direction: column; gap: 10px;
   }
-  .cap-mode-header {
-    display: flex; align-items: center; gap: 8px; cursor: pointer;
-  }
+  .cap-mode-header { display: flex; align-items: center; gap: 8px; cursor: pointer; }
   .cap-mode-header input[type="checkbox"] { accent-color: #6495ed; width: 14px; height: 14px; cursor: pointer; }
   .cap-mode-title { font-size: 0.7rem; color: #6495ed; text-transform: uppercase; letter-spacing: 1px; }
   #cap-label-wrap { display: none; }
@@ -102,9 +85,9 @@
   input[type="range"] { width: 100%; height: 4px; accent-color: #00c864; cursor: pointer; }
 
   .btn {
-    width: 100%; padding: 11px; border: none; border-radius: 4px;
-    font-family: inherit; font-size: 0.82rem; font-weight: bold;
-    letter-spacing: 1px; cursor: pointer; transition: opacity 0.2s, transform 0.1s;
+    width: 100%; padding: 11px; border: none; border-radius: 4px; font-family: inherit;
+    font-size: 0.82rem; font-weight: bold; letter-spacing: 1px; cursor: pointer;
+    transition: opacity 0.2s, transform 0.1s;
   }
   .btn:active { transform: scale(0.98); }
   .btn-start  { background: #00c864; color: #000; }
@@ -114,9 +97,9 @@
   .btn:disabled { opacity: 0.4; cursor: not-allowed; }
 
   .status-pill {
-    display: inline-flex; align-items: center; gap: 6px;
-    font-size: 0.7rem; padding: 4px 10px; border-radius: 20px;
-    background: #1a1a1a; border: 1px solid #2a2a2a; color: #555;
+    display: inline-flex; align-items: center; gap: 6px; font-size: 0.7rem;
+    padding: 4px 10px; border-radius: 20px; background: #1a1a1a;
+    border: 1px solid #2a2a2a; color: #555;
   }
   .status-pill.running { border-color: #00c864; color: #00c864; background: #0a1a0a; }
   .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
@@ -127,40 +110,63 @@
     font-size: 0.72rem; color: #e05555; background: #1a0a0a;
     border: 1px solid #3a1a1a; border-radius: 4px; padding: 8px 10px; display: none;
   }
-
-  /* Save indicator */
-  .save-indicator {
-    display: none; align-items: center; gap: 6px;
-    font-size: 0.68rem; color: #e05555;
-  }
+  .save-indicator { display: none; align-items: center; gap: 6px; font-size: 0.68rem; color: #e05555; }
   .save-indicator.active { display: flex; }
   .rec-dot { width: 8px; height: 8px; border-radius: 50%; background: #e05555; animation: pulse 1s infinite; }
 
-  /* Middle */
+  /* ── Middle column ── */
   .middle { display: flex; flex-direction: column; gap: 14px; }
+
+  /* Video with zoom */
   .video-wrapper {
     background: #0d0d0d; border: 1px solid #1e1e1e; border-radius: 8px;
-    overflow: hidden; aspect-ratio: 16/9;
-    display: flex; align-items: center; justify-content: center; position: relative;
+    overflow: hidden; aspect-ratio: 16/9; position: relative;
+    cursor: crosshair; user-select: none;
   }
-  #video-feed { width: 100%; height: 100%; object-fit: contain; display: none; }
-  .video-placeholder { display: flex; flex-direction: column; align-items: center; gap: 10px; color: #222; }
+  .video-wrapper.zoomed { cursor: grab; }
+  .video-wrapper.dragging { cursor: grabbing; }
+  #video-feed {
+    width: 100%; height: 100%; object-fit: contain;
+    display: none; transform-origin: 0 0;
+    transition: transform 0.05s linear;
+    pointer-events: none;
+  }
+  .video-placeholder {
+    display: flex; flex-direction: column; align-items: center; gap: 10px; color: #222;
+    position: absolute; inset: 0; justify-content: center;
+  }
   .video-placeholder svg { width: 44px; height: 44px; }
   .video-placeholder p { font-size: 0.75rem; }
+
+  /* Zoom controls */
+  .zoom-controls {
+    display: none; position: absolute; bottom: 10px; right: 10px;
+    display: flex; gap: 6px; z-index: 10;
+  }
+  .zoom-btn {
+    background: rgba(0,0,0,0.7); border: 1px solid #333; color: #aaa;
+    width: 28px; height: 28px; border-radius: 4px; cursor: pointer;
+    font-size: 0.9rem; display: flex; align-items: center; justify-content: center;
+    font-family: inherit; transition: color 0.2s;
+  }
+  .zoom-btn:hover { color: #00c864; border-color: #00c864; }
+  #zoom-level {
+    background: rgba(0,0,0,0.7); border: 1px solid #333; color: #aaa;
+    padding: 0 8px; height: 28px; border-radius: 4px;
+    font-size: 0.68rem; display: flex; align-items: center; min-width: 36px; justify-content: center;
+  }
 
   .stream-meta { display: flex; gap: 10px; flex-wrap: wrap; }
   .meta-chip {
     background: #111; border: 1px solid #1e1e1e; border-radius: 6px;
-    padding: 7px 14px; font-size: 0.72rem; color: #444;
-    display: flex; gap: 6px; align-items: center;
+    padding: 7px 14px; font-size: 0.72rem; color: #444; display: flex; gap: 6px; align-items: center;
   }
   .meta-chip span { color: #e0e0e0; font-size: 0.88rem; }
 
-  /* Violation alert bar */
+  /* Violation bar */
   #violation-bar {
     display: none; align-items: center; justify-content: space-between;
-    background: #1a0505; border: 1px solid #cc2222; border-radius: 6px;
-    padding: 10px 16px;
+    background: #1a0505; border: 1px solid #cc2222; border-radius: 6px; padding: 10px 16px;
   }
   #violation-bar.active { display: flex; }
   .viol-left { display: flex; align-items: center; gap: 10px; }
@@ -169,6 +175,7 @@
   .viol-sub  { font-size: 0.68rem; color: #883333; margin-top: 2px; }
   .compliance-pct { font-size: 1.3rem; font-weight: bold; }
 
+  /* Counts row */
   .counts-row { display: flex; flex-wrap: wrap; gap: 10px; }
   .count-card {
     background: #111; border: 1px solid #1e1e1e; border-radius: 6px;
@@ -177,22 +184,42 @@
   .count-card .clbl { font-size: 0.6rem; color: #444; text-transform: uppercase; letter-spacing: 1px; }
   .count-card .cval { font-size: 1.6rem; font-weight: bold; margin-top: 3px; }
 
-  /* Compliance cards */
   .compliance-row { display: flex; gap: 10px; }
-  .comply-card {
-    flex: 1; border-radius: 6px; padding: 10px 16px; text-align: center;
-  }
+  .comply-card { flex: 1; border-radius: 6px; padding: 10px 16px; text-align: center; }
   .comply-card .clbl { font-size: 0.6rem; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 3px; }
   .comply-card .cval { font-size: 1.6rem; font-weight: bold; }
   .card-ok   { background: #0a180a; border: 1px solid #00c86444; }
-  .card-ok   .clbl { color: #2a6a2a; }
-  .card-ok   .cval { color: #00c864; }
+  .card-ok   .clbl { color: #2a6a2a; } .card-ok   .cval { color: #00c864; }
   .card-viol { background: #180a0a; border: 1px solid #cc222244; }
-  .card-viol .clbl { color: #6a2a2a; }
-  .card-viol .cval { color: #ff5555; }
+  .card-viol .clbl { color: #6a2a2a; } .card-viol .cval { color: #ff5555; }
   .card-pct  { background: #111; border: 1px solid #2a2a2a; }
-  .card-pct  .clbl { color: #444; }
-  .card-pct  .cval { color: #e0e0e0; }
+  .card-pct  .clbl { color: #444; } .card-pct  .cval { color: #e0e0e0; }
+
+  /* Person status panel */
+  .person-panel {
+    background: #0d0d0d; border: 1px solid #1e1e1e; border-radius: 8px;
+    padding: 12px; display: none; flex-direction: column; gap: 10px;
+  }
+  .person-panel.visible { display: flex; }
+  .person-panel-title {
+    font-size: 0.62rem; color: #444; text-transform: uppercase; letter-spacing: 2px;
+  }
+  .person-grid { display: flex; flex-wrap: wrap; gap: 8px; }
+  .person-card {
+    border-radius: 6px; overflow: hidden; width: 90px;
+    border: 2px solid #2a2a2a; transition: border-color 0.3s;
+  }
+  .person-card.ok       { border-color: #00c864; }
+  .person-card.violation { border-color: #ff3333; }
+  .person-card img { width: 100%; height: 110px; object-fit: cover; display: block; }
+  .person-card .pc-label {
+    font-size: 0.58rem; padding: 3px 5px; text-align: center;
+    font-weight: bold; letter-spacing: 0.5px;
+  }
+  .person-card.ok       .pc-label { background: #0a1a0a; color: #00c864; }
+  .person-card.violation .pc-label { background: #1a0a0a; color: #ff5555; }
+  .person-card.unknown  .pc-label { background: #1a1a1a; color: #666; }
+  .no-persons { font-size: 0.7rem; color: #333; }
 
   /* Resource panel */
   .res-item { display: flex; flex-direction: column; gap: 6px; }
@@ -201,13 +228,11 @@
   .res-value { font-size: 0.8rem; font-weight: bold; }
   .bar-track { height: 5px; background: #1a1a1a; border-radius: 3px; overflow: hidden; }
   .bar-fill { height: 100%; border-radius: 3px; transition: width 0.6s ease; width: 0%; }
-  .bar-cpu  { background: #cc44cc; }
-  .bar-ram  { background: #ffa500; }
-  .bar-gpu  { background: #00c864; }
-  .bar-vram { background: #6495ed; }
+  .bar-cpu  { background: #cc44cc; } .bar-ram  { background: #ffa500; }
+  .bar-gpu  { background: #00c864; } .bar-vram { background: #6495ed; }
   .res-sub { font-size: 0.62rem; color: #333; }
 
-  /* ── Recordings page ── */
+  /* Recordings */
   .recordings-layout {
     max-width: 1100px; margin: 0 auto; padding: 24px;
     display: grid; grid-template-columns: 1fr 1.6fr; gap: 20px; align-items: start;
@@ -223,7 +248,6 @@
   .rec-name { font-size: 0.8rem; color: #e0e0e0; }
   .rec-meta { font-size: 0.65rem; color: #444; display: flex; gap: 12px; }
   .rec-empty { font-size: 0.78rem; color: #333; padding: 20px 0; }
-
   .video-player-wrap {
     background: #0d0d0d; border: 1px solid #1e1e1e; border-radius: 8px;
     overflow: hidden; aspect-ratio: 16/9;
@@ -231,75 +255,63 @@
   }
   #rec-player { width: 100%; height: 100%; display: none; }
   .player-placeholder { color: #222; font-size: 0.78rem; }
-
   .refresh-btn {
     background: #111; border: 1px solid #2a2a2a; color: #555;
-    padding: 7px 14px; border-radius: 4px; font-family: inherit;
-    font-size: 0.72rem; cursor: pointer; transition: color 0.2s;
+    padding: 7px 14px; border-radius: 4px; font-family: inherit; font-size: 0.72rem; cursor: pointer;
   }
   .refresh-btn:hover { color: #e0e0e0; }
 
-  @media (max-width: 1100px) {
-    .layout { grid-template-columns: 300px 1fr; }
-    .resource-panel { display: none; }
-  }
-  @media (max-width: 750px) {
-    .layout { grid-template-columns: 1fr; }
-    .recordings-layout { grid-template-columns: 1fr; }
-  }
+  @media (max-width: 1200px) { .layout { grid-template-columns: 280px 1fr; } .resource-panel { display: none; } }
+  @media (max-width: 750px)  { .layout { grid-template-columns: 1fr; } .recordings-layout { grid-template-columns: 1fr; } }
 </style>
 </head>
 <body>
 
 <header>
   <h1>⬡ SAM3 LIVE DETECTION</h1>
-  <span>RTX 5060 Ti · SAM3 + ByteTrack</span>
+  <span>RTX 5060 Ti · SAM3 + ByteTrack · SAHI</span>
 </header>
 
-<!-- Tabs -->
 <div class="tabs">
-  <button class="tab active" onclick="switchTab('live', this)">Live Stream</button>
-  <button class="tab" onclick="switchTab('recordings', this)">Recordings</button>
+  <button class="tab active" onclick="switchTab('live',this)">Live Stream</button>
+  <button class="tab" onclick="switchTab('recordings',this)">Recordings</button>
 </div>
 
-<!-- ══════════ LIVE PAGE ══════════ -->
+<!-- ══════ LIVE PAGE ══════ -->
 <div id="page-live" class="page active">
 <div class="layout">
 
   <!-- Left config -->
   <div class="panel">
     <div class="panel-title">Session Config</div>
-
     <div>
       <div class="status-pill" id="status-pill">
         <span class="dot" id="status-dot"></span>
         <span id="status-text">Idle</span>
       </div>
     </div>
-
     <div>
       <label>RTSP Stream URL</label>
       <input type="text" id="rtsp-url" placeholder="rtsp://192.168.1.x:554/stream"/>
     </div>
-
     <div>
       <label>Detection Targets</label>
       <div class="tags-wrapper" id="tags-wrapper" onclick="document.getElementById('tag-input').focus()">
         <input id="tag-input" type="text" placeholder="Type label, press Enter"/>
       </div>
-      <p class="hint">e.g. person · car · laptop · dog</p>
+      <p class="hint">e.g. person · hairnet · hard hat</p>
     </div>
 
-    <!-- Head Cap Compliance Mode -->
+    <!-- Head Cap Mode -->
     <div class="cap-mode-section">
       <div class="cap-mode-header" onclick="toggleCapMode()">
         <input type="checkbox" id="cap-mode-check"/>
         <span class="cap-mode-title">Head Cap Compliance Mode</span>
       </div>
       <div id="cap-label-wrap">
-        <label style="color:#4a4a7a">Cap Label (must match a detection target above)</label>
-        <input type="text" id="cap-label-input" placeholder="e.g. transparent plastic head cap"/>
-        <p class="hint" style="color:#2a2a4a">Workers without a cap will be flagged in red</p>
+        <label style="color:#4a4a7a">Cap Label (must match a detection target)</label>
+        <input type="text" id="cap-label-input" placeholder="e.g. hairnet"/>
+        <p class="hint" style="color:#2a2a4a">Workers without cap flagged in red</p>
       </div>
     </div>
 
@@ -313,20 +325,19 @@
     </div>
 
     <div id="error-msg"></div>
-
     <button class="btn btn-start" id="btn-start" onclick="startSession()">▶ START SESSION</button>
     <button class="btn btn-stop"  id="btn-stop"  onclick="stopSession()">■ STOP SESSION</button>
     <button class="btn btn-save"  id="btn-save"  onclick="toggleSave()">⏺ START RECORDING</button>
-
     <div class="save-indicator" id="save-indicator">
-      <div class="rec-dot"></div>
-      <span>Recording to disk...</span>
+      <div class="rec-dot"></div><span>Recording...</span>
     </div>
   </div>
 
-  <!-- Middle video + stats -->
+  <!-- Middle -->
   <div class="middle">
-    <div class="video-wrapper">
+
+    <!-- Video with zoom -->
+    <div class="video-wrapper" id="video-wrapper">
       <div class="video-placeholder" id="video-placeholder">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1">
           <rect x="2" y="7" width="15" height="10" rx="1"/>
@@ -335,6 +346,12 @@
         <p>Configure and start a session to view the stream</p>
       </div>
       <img id="video-feed" src="" alt="live feed"/>
+      <div class="zoom-controls">
+        <button class="zoom-btn" onclick="zoomIn()" title="Zoom in">+</button>
+        <div id="zoom-level">1×</div>
+        <button class="zoom-btn" onclick="zoomOut()" title="Zoom out">−</button>
+        <button class="zoom-btn" onclick="resetZoom()" title="Reset zoom">⊙</button>
+      </div>
     </div>
 
     <div class="stream-meta">
@@ -343,7 +360,7 @@
       <div class="meta-chip">Tracked &nbsp;<span id="s-tracked">—</span></div>
     </div>
 
-    <!-- Violation alert bar (hidden when no violations) -->
+    <!-- Violation alert -->
     <div id="violation-bar">
       <div class="viol-left">
         <span class="viol-icon">⚠</span>
@@ -355,59 +372,43 @@
       <div class="compliance-pct" id="compliance-pct" style="color:#ff5555">—</div>
     </div>
 
-    <!-- Compliance summary (shown only in cap mode) -->
+    <!-- Compliance summary -->
     <div class="compliance-row" id="compliance-row" style="display:none">
-      <div class="comply-card card-ok">
-        <div class="clbl">With Cap</div>
-        <div class="cval" id="c-compliant">0</div>
-      </div>
-      <div class="comply-card card-viol">
-        <div class="clbl">No Cap</div>
-        <div class="cval" id="c-violations">0</div>
-      </div>
-      <div class="comply-card card-pct">
-        <div class="clbl">Compliance</div>
-        <div class="cval" id="c-pct">—</div>
-      </div>
+      <div class="comply-card card-ok">  <div class="clbl">With Cap</div>  <div class="cval" id="c-compliant">0</div>  </div>
+      <div class="comply-card card-viol"><div class="clbl">No Cap</div>    <div class="cval" id="c-violations">0</div> </div>
+      <div class="comply-card card-pct"> <div class="clbl">Compliance</div><div class="cval" id="c-pct">—</div>        </div>
     </div>
 
     <div class="counts-row" id="counts-row"></div>
-  </div>
 
-  <!-- Right resource monitor -->
-  <div class="panel resource-panel">
-    <div class="panel-title">Resources</div>
-
-    <div class="res-item">
-      <div class="res-header">
-        <span class="res-label">CPU</span>
-        <span class="res-value" id="r-cpu">—</span>
+    <!-- Person status panel (cap mode only) -->
+    <div class="person-panel" id="person-panel">
+      <div class="person-panel-title">Worker Status</div>
+      <div class="person-grid" id="person-grid">
+        <span class="no-persons">No workers detected</span>
       </div>
-      <div class="bar-track"><div class="bar-fill bar-cpu" id="b-cpu"></div></div>
     </div>
 
+  </div>
+
+  <!-- Resource panel -->
+  <div class="panel resource-panel">
+    <div class="panel-title">Resources</div>
     <div class="res-item">
-      <div class="res-header">
-        <span class="res-label">RAM</span>
-        <span class="res-value" id="r-ram">—</span>
-      </div>
+      <div class="res-header"><span class="res-label">CPU</span><span class="res-value" id="r-cpu">—</span></div>
+      <div class="bar-track"><div class="bar-fill bar-cpu" id="b-cpu"></div></div>
+    </div>
+    <div class="res-item">
+      <div class="res-header"><span class="res-label">RAM</span><span class="res-value" id="r-ram">—</span></div>
       <div class="bar-track"><div class="bar-fill bar-ram" id="b-ram"></div></div>
       <div class="res-sub" id="r-ram-sub"></div>
     </div>
-
     <div class="res-item">
-      <div class="res-header">
-        <span class="res-label">GPU</span>
-        <span class="res-value" id="r-gpu">—</span>
-      </div>
+      <div class="res-header"><span class="res-label">GPU</span><span class="res-value" id="r-gpu">—</span></div>
       <div class="bar-track"><div class="bar-fill bar-gpu" id="b-gpu"></div></div>
     </div>
-
     <div class="res-item">
-      <div class="res-header">
-        <span class="res-label">VRAM</span>
-        <span class="res-value" id="r-vram">—</span>
-      </div>
+      <div class="res-header"><span class="res-label">VRAM</span><span class="res-value" id="r-vram">—</span></div>
       <div class="bar-track"><div class="bar-fill bar-vram" id="b-vram"></div></div>
       <div class="res-sub" id="r-vram-sub"></div>
     </div>
@@ -416,378 +417,406 @@
 </div>
 </div>
 
-<!-- ══════════ RECORDINGS PAGE ══════════ -->
+<!-- ══════ RECORDINGS PAGE ══════ -->
 <div id="page-recordings" class="page">
 <div class="recordings-layout">
-
   <div>
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
       <span style="font-size:0.65rem;letter-spacing:2px;color:#444;text-transform:uppercase">Saved Recordings</span>
       <button class="refresh-btn" onclick="loadRecordings()">↻ Refresh</button>
     </div>
-    <div class="rec-list" id="rec-list">
-      <div class="rec-empty">No recordings found.</div>
-    </div>
+    <div class="rec-list" id="rec-list"><div class="rec-empty">No recordings found.</div></div>
   </div>
-
   <div class="video-player-wrap">
     <video id="rec-player" controls></video>
     <div class="player-placeholder" id="player-placeholder">Select a recording to play</div>
   </div>
-
 </div>
 </div>
 
 <script>
-  // ── Tab switching ──────────────────────────────────────────────────────────
-  function switchTab(name, el) {
-    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-    document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
-    el.classList.add('active');
-    document.getElementById('page-' + name).classList.add('active');
-    if (name === 'recordings') loadRecordings();
+// ── Tab switching ──────────────────────────────────────────────────────────────
+function switchTab(name, el) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  el.classList.add('active');
+  document.getElementById('page-' + name).classList.add('active');
+  if (name === 'recordings') loadRecordings();
+}
+
+// ── Tags ───────────────────────────────────────────────────────────────────────
+let tags = [];
+const tagInput = document.getElementById('tag-input');
+tagInput.addEventListener('keydown', e => {
+  if ((e.key === 'Enter' || e.key === ',') && tagInput.value.trim()) {
+    e.preventDefault(); addTag(tagInput.value.trim().toLowerCase()); tagInput.value = '';
   }
+  if (e.key === 'Backspace' && tagInput.value === '' && tags.length) removeTag(tags[tags.length - 1]);
+});
+function addTag(v) {
+  if (!v || tags.includes(v)) return;
+  tags.push(v); renderTags();
+}
+function removeTag(v) { tags = tags.filter(t => t !== v); renderTags(); }
+function renderTags() {
+  document.querySelectorAll('#tags-wrapper .tag').forEach(e => e.remove());
+  tags.forEach(t => {
+    const el = document.createElement('div'); el.className = 'tag';
+    el.innerHTML = `${t}<button onclick="removeTag('${t}')">×</button>`;
+    document.getElementById('tags-wrapper').insertBefore(el, tagInput);
+  });
+}
 
-  // ── Tags ───────────────────────────────────────────────────────────────────
-  let tags = [];
-  const tagInput    = document.getElementById('tag-input');
-  const tagsWrapper = document.getElementById('tags-wrapper');
+// ── Cap mode ───────────────────────────────────────────────────────────────────
+function toggleCapMode() {
+  const chk = document.getElementById('cap-mode-check');
+  chk.checked = !chk.checked;
+  document.getElementById('cap-label-wrap').classList.toggle('visible', chk.checked);
+}
+function getCapLabel() {
+  return document.getElementById('cap-mode-check').checked
+    ? document.getElementById('cap-label-input').value.trim().toLowerCase() : '';
+}
 
-  tagInput.addEventListener('keydown', e => {
-    if ((e.key === 'Enter' || e.key === ',') && tagInput.value.trim()) {
-      e.preventDefault();
-      addTag(tagInput.value.trim().toLowerCase());
-      tagInput.value = '';
+// ── Zoom ───────────────────────────────────────────────────────────────────────
+let zoom = 1, panX = 0, panY = 0;
+let dragging = false, dragStartX = 0, dragStartY = 0, panStartX = 0, panStartY = 0;
+
+const wrapper = document.getElementById('video-wrapper');
+const videoEl = document.getElementById('video-feed');
+
+function applyZoom() {
+  const maxPanX = wrapper.clientWidth  * (zoom - 1);
+  const maxPanY = wrapper.clientHeight * (zoom - 1);
+  panX = Math.max(-maxPanX, Math.min(0, panX));
+  panY = Math.max(-maxPanY, Math.min(0, panY));
+  videoEl.style.transform = `scale(${zoom}) translate(${panX/zoom}px, ${panY/zoom}px)`;
+  document.getElementById('zoom-level').textContent = zoom.toFixed(1) + '×';
+  wrapper.classList.toggle('zoomed', zoom > 1);
+}
+function zoomIn()   { zoom = Math.min(8, zoom * 1.4); applyZoom(); }
+function zoomOut()  { zoom = Math.max(1, zoom / 1.4); if (zoom <= 1) { panX = 0; panY = 0; } applyZoom(); }
+function resetZoom(){ zoom = 1; panX = 0; panY = 0; applyZoom(); }
+
+// Scroll wheel zoom (centred on cursor position)
+wrapper.addEventListener('wheel', e => {
+  e.preventDefault();
+  const rect   = wrapper.getBoundingClientRect();
+  const cx     = e.clientX - rect.left;
+  const cy     = e.clientY - rect.top;
+  const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+  const newZ   = Math.max(1, Math.min(8, zoom * factor));
+  // Adjust pan so the point under the cursor stays fixed
+  panX = cx - (cx - panX) * (newZ / zoom);
+  panY = cy - (cy - panY) * (newZ / zoom);
+  zoom = newZ;
+  if (zoom <= 1) { zoom = 1; panX = 0; panY = 0; }
+  applyZoom();
+}, { passive: false });
+
+// Drag to pan
+wrapper.addEventListener('mousedown', e => {
+  if (zoom <= 1) return;
+  dragging = true; dragStartX = e.clientX; dragStartY = e.clientY;
+  panStartX = panX; panStartY = panY;
+  wrapper.classList.add('dragging');
+});
+window.addEventListener('mousemove', e => {
+  if (!dragging) return;
+  panX = panStartX + (e.clientX - dragStartX);
+  panY = panStartY + (e.clientY - dragStartY);
+  applyZoom();
+});
+window.addEventListener('mouseup', () => {
+  dragging = false; wrapper.classList.remove('dragging');
+});
+
+// Double-click to reset
+wrapper.addEventListener('dblclick', resetZoom);
+
+// ── Session ────────────────────────────────────────────────────────────────────
+async function startSession() {
+  const rtsp     = document.getElementById('rtsp-url').value.trim();
+  const conf     = parseFloat(document.getElementById('confidence').value);
+  const capLabel = getCapLabel();
+  if (!rtsp)        { showError('Please enter an RTSP URL.'); return; }
+  if (!tags.length) { showError('Add at least one detection target.'); return; }
+  if (capLabel && !tags.includes(capLabel)) {
+    showError(`Cap label "${capLabel}" must match one of your detection targets.`); return;
+  }
+  hideError(); setUIState('starting');
+  try {
+    const res  = await fetch('/session/start', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({rtsp_url: rtsp, labels: tags, confidence: conf,
+                            every_n: 5, save: false, cap_label: capLabel})
+    });
+    const data = await res.json();
+    if (!res.ok) { showError(data.detail || 'Failed to start.'); setUIState('idle'); return; }
+    setUIState('running'); startPolling(); showVideo();
+    if (capLabel) { showComplianceUI(true); showPersonPanel(true); }
+  } catch(e) { showError('Could not reach server.'); setUIState('idle'); }
+}
+
+async function stopSession() {
+  setUIState('stopping');
+  try { await fetch('/session/stop', {method:'POST'}); } catch(e) {}
+  setTimeout(() => {
+    setUIState('idle'); stopPolling(); hideVideo(); resetStats();
+    setSaveUI(false); showComplianceUI(false); showPersonPanel(false); resetZoom();
+  }, 3500);
+}
+
+let isSaving = false;
+async function toggleSave() {
+  isSaving = !isSaving;
+  try {
+    await fetch('/session/save', {method:'POST', headers:{'Content-Type':'application/json'},
+                                  body: JSON.stringify({save: isSaving})});
+  } catch(e) {}
+  setSaveUI(isSaving);
+}
+function setSaveUI(s) {
+  isSaving = s;
+  const btn = document.getElementById('btn-save');
+  const ind = document.getElementById('save-indicator');
+  btn.textContent = s ? '⏹ STOP RECORDING' : '⏺ START RECORDING';
+  btn.classList.toggle('saving', s);
+  ind.classList.toggle('active', s);
+}
+
+// ── Polling ────────────────────────────────────────────────────────────────────
+let pollTimer = null, cropsTimer = null;
+const palette = ['#00c864','#ffa500','#6495ed','#cc44cc','#00c8c8','#c8c800','#ff5050','#50ff50'];
+
+function startPolling() {
+  pollTimer  = setInterval(pollStatus, 1500);
+  cropsTimer = setInterval(pollCrops,  2000);
+}
+function stopPolling() {
+  if (pollTimer)  { clearInterval(pollTimer);  pollTimer  = null; }
+  if (cropsTimer) { clearInterval(cropsTimer); cropsTimer = null; }
+}
+
+async function pollStatus() {
+  try {
+    const d = await (await fetch('/session/status')).json();
+    document.getElementById('s-fps').textContent     = d.fps.toFixed(1);
+    document.getElementById('s-frames').textContent  = d.frame_idx;
+    document.getElementById('s-tracked').textContent = Object.values(d.counts).reduce((a,b)=>a+b,0);
+    updateCountCards(d.counts, d.labels || tags);
+    if (d.cap_label) updateComplianceUI(d.violations||0, d.compliant||0);
+    if (d.saving !== isSaving) setSaveUI(d.saving);
+    if (d.error)  showError(d.error);
+    if (!d.running && document.getElementById('btn-stop').style.display !== 'none') {
+      setUIState('idle'); stopPolling(); stopResourcePolling();
+      hideVideo(); setSaveUI(false); showComplianceUI(false); showPersonPanel(false);
     }
-    if (e.key === 'Backspace' && tagInput.value === '' && tags.length) {
-      removeTag(tags[tags.length - 1]);
+  } catch(e) {}
+}
+
+async function pollCrops() {
+  try {
+    const crops = await (await fetch('/crops')).json();
+    updatePersonPanel(crops);
+  } catch(e) {}
+}
+
+function updateCountCards(counts, labelList) {
+  const row = document.getElementById('counts-row');
+  row.innerHTML = '';
+  labelList.forEach((lbl, i) => {
+    const color = palette[i % palette.length];
+    const card  = document.createElement('div');
+    card.className = 'count-card';
+    card.style.borderColor = color + '44';
+    card.innerHTML = `<div class="clbl">${lbl}</div>
+      <div class="cval" style="color:${color}">${counts[lbl] ?? 0}</div>`;
+    row.appendChild(card);
+  });
+}
+
+// ── Compliance UI ──────────────────────────────────────────────────────────────
+function showComplianceUI(v) {
+  document.getElementById('compliance-row').style.display = v ? 'flex' : 'none';
+  if (!v) document.getElementById('violation-bar').classList.remove('active');
+}
+function showPersonPanel(v) {
+  document.getElementById('person-panel').classList.toggle('visible', v);
+}
+
+function updateComplianceUI(violations, compliant) {
+  const total = violations + compliant;
+  const pct   = total > 0 ? Math.round(compliant / total * 100) : 100;
+  document.getElementById('c-compliant').textContent  = compliant;
+  document.getElementById('c-violations').textContent = violations;
+  document.getElementById('c-pct').textContent        = pct + '%';
+  document.getElementById('c-pct').style.color        = pct >= 100 ? '#00c864' : pct >= 80 ? '#ffa500' : '#ff5555';
+  const bar = document.getElementById('violation-bar');
+  if (violations > 0) {
+    bar.classList.add('active');
+    document.getElementById('viol-text').textContent =
+      `${violations} worker${violations > 1 ? 's' : ''} without head cap`;
+    const p = document.getElementById('compliance-pct');
+    p.textContent = pct + '% compliant';
+    p.style.color = pct >= 80 ? '#ffa500' : '#ff5555';
+  } else {
+    bar.classList.remove('active');
+  }
+}
+
+function updatePersonPanel(crops) {
+  const grid = document.getElementById('person-grid');
+  const ids  = Object.keys(crops);
+  if (!ids.length) {
+    grid.innerHTML = '<span class="no-persons">No workers detected</span>';
+    return;
+  }
+  // Keep existing cards, add/update, remove stale
+  const existing = {};
+  grid.querySelectorAll('.person-card').forEach(c => {
+    existing[c.dataset.tid] = c;
+  });
+  const seen = new Set();
+  ids.forEach(tid => {
+    seen.add(tid);
+    const { img, status } = crops[tid];
+    if (existing[tid]) {
+      const card = existing[tid];
+      card.querySelector('img').src   = 'data:image/jpeg;base64,' + img;
+      card.className = `person-card ${status}`;
+      card.querySelector('.pc-label').textContent =
+        status === 'ok' ? `#${tid} CAP OK` : status === 'violation' ? `#${tid} NO CAP` : `#${tid}`;
+    } else {
+      const card = document.createElement('div');
+      card.className = `person-card ${status}`;
+      card.dataset.tid = tid;
+      card.innerHTML = `<img src="data:image/jpeg;base64,${img}" alt="worker ${tid}"/>
+        <div class="pc-label">${status === 'ok' ? `#${tid} CAP OK` : status === 'violation' ? `#${tid} NO CAP` : `#${tid}`}</div>`;
+      grid.appendChild(card);
     }
   });
+  // Remove cards for tracks that disappeared
+  Object.keys(existing).forEach(tid => {
+    if (!seen.has(tid)) existing[tid].remove();
+  });
+}
 
-  function addTag(val) {
-    if (!val || tags.includes(val)) return;
-    tags.push(val);
-    renderTags();
+// ── Resources ──────────────────────────────────────────────────────────────────
+let resTimer = null;
+async function updateResources() {
+  try {
+    const d = await (await fetch('/resources')).json();
+    document.getElementById('r-cpu').textContent = d.cpu_percent + '%';
+    document.getElementById('b-cpu').style.width = d.cpu_percent + '%';
+    document.getElementById('r-ram').textContent = d.ram_percent + '%';
+    document.getElementById('b-ram').style.width = d.ram_percent + '%';
+    document.getElementById('r-ram-sub').textContent = `${d.ram_used_gb} / ${d.ram_total_gb} GB`;
+    if (d.gpu_util !== null) {
+      document.getElementById('r-gpu').textContent = d.gpu_util + '%';
+      document.getElementById('b-gpu').style.width = d.gpu_util + '%';
+    }
+    if (d.gpu_mem_used !== null) {
+      const pct = Math.round(d.gpu_mem_used / d.gpu_mem_total * 100);
+      document.getElementById('r-vram').textContent = pct + '%';
+      document.getElementById('b-vram').style.width = pct + '%';
+      document.getElementById('r-vram-sub').textContent = `${d.gpu_mem_used} / ${d.gpu_mem_total} MB`;
+    }
+  } catch(e) {}
+}
+updateResources();
+resTimer = setInterval(updateResources, 2000);
+function stopResourcePolling() { if (resTimer) { clearInterval(resTimer); resTimer = null; } }
+
+// ── UI helpers ─────────────────────────────────────────────────────────────────
+function setUIState(s) {
+  const pill = document.getElementById('status-pill');
+  const dot  = document.getElementById('status-dot');
+  const txt  = document.getElementById('status-text');
+  const start = document.getElementById('btn-start');
+  const stop  = document.getElementById('btn-stop');
+  const save  = document.getElementById('btn-save');
+  pill.className = 'status-pill'; dot.className = 'dot';
+  if (s === 'running') {
+    pill.classList.add('running'); dot.classList.add('pulse');
+    txt.textContent = 'Running';
+    start.style.display = 'none'; stop.style.display = 'block'; save.style.display = 'block';
+    start.disabled = false; stop.disabled = false;
+  } else if (s === 'starting' || s === 'stopping') {
+    txt.textContent = s === 'starting' ? 'Starting...' : 'Stopping...';
+    start.disabled = true; stop.disabled = true;
+  } else {
+    txt.textContent = 'Idle';
+    start.style.display = 'block'; start.disabled = false;
+    stop.style.display = 'none'; save.style.display = 'none'; stop.disabled = false;
   }
-  function removeTag(val) {
-    tags = tags.filter(t => t !== val);
-    renderTags();
-  }
-  function renderTags() {
-    tagsWrapper.querySelectorAll('.tag').forEach(el => el.remove());
-    tags.forEach(t => {
-      const el = document.createElement('div');
-      el.className = 'tag';
-      el.innerHTML = `${t}<button onclick="removeTag('${t}')" title="Remove">×</button>`;
-      tagsWrapper.insertBefore(el, tagInput);
+}
+function showVideo() {
+  document.getElementById('video-feed').src = '/video?' + Date.now();
+  document.getElementById('video-feed').style.display = 'block';
+  document.getElementById('video-placeholder').style.display = 'none';
+}
+function hideVideo() {
+  const f = document.getElementById('video-feed');
+  f.style.display = 'none'; f.src = '';
+  document.getElementById('video-placeholder').style.display = 'flex';
+}
+function resetStats() {
+  ['s-fps','s-frames','s-tracked'].forEach(id => document.getElementById(id).textContent = '—');
+  document.getElementById('counts-row').innerHTML = '';
+  document.getElementById('c-compliant').textContent = '0';
+  document.getElementById('c-violations').textContent = '0';
+  document.getElementById('c-pct').textContent = '—';
+  document.getElementById('violation-bar').classList.remove('active');
+  document.getElementById('person-grid').innerHTML = '<span class="no-persons">No workers detected</span>';
+}
+function showError(msg) { const e = document.getElementById('error-msg'); e.textContent = '⚠ ' + msg; e.style.display = 'block'; }
+function hideError() { document.getElementById('error-msg').style.display = 'none'; }
+
+// ── Recordings ─────────────────────────────────────────────────────────────────
+async function loadRecordings() {
+  const list = document.getElementById('rec-list');
+  list.innerHTML = '<div class="rec-empty">Loading...</div>';
+  try {
+    const files = await (await fetch('/recordings')).json();
+    if (!files.length) { list.innerHTML = '<div class="rec-empty">No recordings found.</div>'; return; }
+    list.innerHTML = '';
+    files.forEach(f => {
+      const el = document.createElement('div'); el.className = 'rec-item';
+      el.innerHTML = `<div class="rec-name">${f.name}</div>
+        <div class="rec-meta"><span>${f.size_mb} MB</span><span>${f.modified}</span></div>`;
+      el.onclick = () => playRecording(f.name, el);
+      list.appendChild(el);
     });
-  }
+  } catch(e) { list.innerHTML = '<div class="rec-empty">Failed to load.</div>'; }
+}
+function playRecording(filename, el) {
+  document.querySelectorAll('.rec-item').forEach(i => i.classList.remove('selected'));
+  el.classList.add('selected');
+  const player = document.getElementById('rec-player');
+  player.src = `/recordings/${filename}`; player.style.display = 'block';
+  document.getElementById('player-placeholder').style.display = 'none';
+  player.play();
+}
 
-  // ── Cap mode toggle ────────────────────────────────────────────────────────
-  function toggleCapMode() {
-    const chk  = document.getElementById('cap-mode-check');
-    const wrap = document.getElementById('cap-label-wrap');
-    chk.checked = !chk.checked;
-    wrap.classList.toggle('visible', chk.checked);
-  }
-
-  function getCapLabel() {
-    const chk = document.getElementById('cap-mode-check');
-    if (!chk.checked) return '';
-    return document.getElementById('cap-label-input').value.trim().toLowerCase();
-  }
-
-  // ── Session ────────────────────────────────────────────────────────────────
-  async function startSession() {
-    const rtsp     = document.getElementById('rtsp-url').value.trim();
-    const conf     = parseFloat(document.getElementById('confidence').value);
-    const capLabel = getCapLabel();
-
-    if (!rtsp)        { showError('Please enter an RTSP URL.'); return; }
-    if (!tags.length) { showError('Add at least one detection target.'); return; }
-    if (capLabel && !tags.includes(capLabel)) {
-      showError(`Cap label "${capLabel}" must match one of your detection targets.`); return;
-    }
-
-    hideError();
-    setUIState('starting');
-
-    try {
-      const res  = await fetch('/session/start', {
-        method: 'POST',
-        headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({
-          rtsp_url:  rtsp,
-          labels:    tags,
-          confidence: conf,
-          every_n:   5,
-          save:      false,
-          cap_label: capLabel,
-        })
-      });
-      const data = await res.json();
-      if (!res.ok) { showError(data.detail || 'Failed to start.'); setUIState('idle'); return; }
-      setUIState('running');
-      startPolling();
-      showVideo();
-      if (capLabel) showComplianceUI(true);
-    } catch(e) {
-      showError('Could not reach server.');
-      setUIState('idle');
-    }
-  }
-
-  async function stopSession() {
-    setUIState('stopping');
-    try { await fetch('/session/stop', {method:'POST'}); } catch(e) {}
-    setTimeout(() => {
-      setUIState('idle');
-      stopPolling();
-      hideVideo();
-      resetStats();
-      setSaveUI(false);
-      showComplianceUI(false);
-    }, 3500);
-  }
-
-  let isSaving = false;
-  async function toggleSave() {
-    isSaving = !isSaving;
-    try {
-      await fetch('/session/save', {
-        method: 'POST',
-        headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({save: isSaving})
-      });
-    } catch(e) {}
-    setSaveUI(isSaving);
-  }
-
-  function setSaveUI(saving) {
-    isSaving = saving;
-    const btn = document.getElementById('btn-save');
-    const ind = document.getElementById('save-indicator');
-    if (saving) {
-      btn.textContent = '⏹ STOP RECORDING';
-      btn.classList.add('saving');
-      ind.classList.add('active');
-    } else {
-      btn.textContent = '⏺ START RECORDING';
-      btn.classList.remove('saving');
-      ind.classList.remove('active');
-    }
-  }
-
-  // ── Compliance UI ──────────────────────────────────────────────────────────
-  function showComplianceUI(visible) {
-    document.getElementById('compliance-row').style.display = visible ? 'flex' : 'none';
-    if (!visible) {
-      document.getElementById('violation-bar').classList.remove('active');
-    }
-  }
-
-  function updateComplianceUI(violations, compliant, capActive) {
-    if (!capActive) return;
-    const total = violations + compliant;
-    const pct   = total > 0 ? Math.round((compliant / total) * 100) : 100;
-
-    document.getElementById('c-compliant').textContent  = compliant;
-    document.getElementById('c-violations').textContent = violations;
-    document.getElementById('c-pct').textContent        = pct + '%';
-    document.getElementById('c-pct').style.color        = pct >= 100 ? '#00c864' : pct >= 80 ? '#ffa500' : '#ff5555';
-
-    const bar = document.getElementById('violation-bar');
-    if (violations > 0) {
-      bar.classList.add('active');
-      document.getElementById('viol-text').textContent =
-        `${violations} worker${violations > 1 ? 's' : ''} without head cap`;
-      const pctEl = document.getElementById('compliance-pct');
-      pctEl.textContent = pct + '% compliant';
-      pctEl.style.color = pct >= 80 ? '#ffa500' : '#ff5555';
-    } else {
-      bar.classList.remove('active');
-    }
-  }
-
-  // ── Polling ────────────────────────────────────────────────────────────────
-  let pollTimer = null;
-  const palette = ['#00c864','#ffa500','#6495ed','#cc44cc','#00c8c8','#c8c800','#ff5050','#50ff50'];
-
-  function startPolling() {
-    pollTimer = setInterval(async () => {
-      try {
-        const d = await (await fetch('/session/status')).json();
-        document.getElementById('s-fps').textContent     = d.fps.toFixed(1);
-        document.getElementById('s-frames').textContent  = d.frame_idx;
-        document.getElementById('s-tracked').textContent = Object.values(d.counts).reduce((a,b)=>a+b,0);
-        updateCountCards(d.counts, d.labels || tags);
-        updateComplianceUI(d.violations || 0, d.compliant || 0, !!d.cap_label);
-        if (d.saving !== isSaving) setSaveUI(d.saving);
-        if (d.error) showError(d.error);
-        if (!d.running && document.getElementById('btn-stop').style.display !== 'none') {
-          setUIState('idle'); stopPolling(); stopResourcePolling(); hideVideo();
-          setSaveUI(false); showComplianceUI(false);
-        }
-      } catch(e) {}
-    }, 1500);
-  }
-  function stopPolling() {
-    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
-  }
-
-  function updateCountCards(counts, labelList) {
-    const row = document.getElementById('counts-row');
-    row.innerHTML = '';
-    labelList.forEach((lbl, i) => {
-      const color = palette[i % palette.length];
-      const card  = document.createElement('div');
-      card.className = 'count-card';
-      card.style.borderColor = color + '44';
-      card.innerHTML = `<div class="clbl">${lbl}</div>
-        <div class="cval" style="color:${color}">${counts[lbl] ?? 0}</div>`;
-      row.appendChild(card);
-    });
-  }
-
-  // ── Resource monitor ───────────────────────────────────────────────────────
-  let resTimer = null;
-  async function updateResources() {
-    try {
-      const d = await (await fetch('/resources')).json();
-      document.getElementById('r-cpu').textContent = d.cpu_percent + '%';
-      document.getElementById('b-cpu').style.width = d.cpu_percent + '%';
-      document.getElementById('r-ram').textContent = d.ram_percent + '%';
-      document.getElementById('b-ram').style.width = d.ram_percent + '%';
-      document.getElementById('r-ram-sub').textContent = `${d.ram_used_gb} / ${d.ram_total_gb} GB`;
-      if (d.gpu_util !== null) {
-        document.getElementById('r-gpu').textContent = d.gpu_util + '%';
-        document.getElementById('b-gpu').style.width = d.gpu_util + '%';
+// ── Restore on reload ──────────────────────────────────────────────────────────
+(async () => {
+  try {
+    const d = await (await fetch('/session/status')).json();
+    if (d.running) {
+      document.getElementById('rtsp-url').value = d.rtsp_url || '';
+      d.labels?.forEach(addTag);
+      setUIState('running'); startPolling(); showVideo();
+      if (d.saving) setSaveUI(true);
+      if (d.cap_label) {
+        document.getElementById('cap-mode-check').checked = true;
+        document.getElementById('cap-label-input').value  = d.cap_label;
+        document.getElementById('cap-label-wrap').classList.add('visible');
+        showComplianceUI(true); showPersonPanel(true);
       }
-      if (d.gpu_mem_used !== null) {
-        const pct = Math.round(d.gpu_mem_used / d.gpu_mem_total * 100);
-        document.getElementById('r-vram').textContent = pct + '%';
-        document.getElementById('b-vram').style.width = pct + '%';
-        document.getElementById('r-vram-sub').textContent = `${d.gpu_mem_used} / ${d.gpu_mem_total} MB`;
-      }
-    } catch(e) {}
-  }
-  updateResources();
-  resTimer = setInterval(updateResources, 2000);
-  function stopResourcePolling() { if (resTimer) { clearInterval(resTimer); resTimer = null; } }
-
-  // ── UI helpers ─────────────────────────────────────────────────────────────
-  function setUIState(s) {
-    const pill  = document.getElementById('status-pill');
-    const dot   = document.getElementById('status-dot');
-    const txt   = document.getElementById('status-text');
-    const start = document.getElementById('btn-start');
-    const stop  = document.getElementById('btn-stop');
-    const save  = document.getElementById('btn-save');
-    pill.className = 'status-pill'; dot.className = 'dot';
-    if (s === 'running') {
-      pill.classList.add('running'); dot.classList.add('pulse');
-      txt.textContent = 'Running';
-      start.style.display = 'none';
-      stop.style.display  = 'block';
-      save.style.display  = 'block';
-      start.disabled = false; stop.disabled = false;
-    } else if (s === 'starting' || s === 'stopping') {
-      txt.textContent = s === 'starting' ? 'Starting...' : 'Stopping...';
-      start.disabled = true; stop.disabled = true;
-    } else {
-      txt.textContent = 'Idle';
-      start.style.display = 'block'; start.disabled = false;
-      stop.style.display  = 'none';
-      save.style.display  = 'none';
-      stop.disabled = false;
     }
-  }
-
-  function showVideo() {
-    document.getElementById('video-feed').src = '/video?' + Date.now();
-    document.getElementById('video-feed').style.display = 'block';
-    document.getElementById('video-placeholder').style.display = 'none';
-  }
-  function hideVideo() {
-    const f = document.getElementById('video-feed');
-    f.style.display = 'none'; f.src = '';
-    document.getElementById('video-placeholder').style.display = 'flex';
-  }
-  function resetStats() {
-    document.getElementById('s-fps').textContent     = '—';
-    document.getElementById('s-frames').textContent  = '—';
-    document.getElementById('s-tracked').textContent = '—';
-    document.getElementById('counts-row').innerHTML  = '';
-    document.getElementById('c-compliant').textContent  = '0';
-    document.getElementById('c-violations').textContent = '0';
-    document.getElementById('c-pct').textContent        = '—';
-    document.getElementById('violation-bar').classList.remove('active');
-  }
-  function showError(msg) {
-    const el = document.getElementById('error-msg');
-    el.textContent = '⚠ ' + msg; el.style.display = 'block';
-  }
-  function hideError() { document.getElementById('error-msg').style.display = 'none'; }
-
-  // ── Recordings ─────────────────────────────────────────────────────────────
-  async function loadRecordings() {
-    const list = document.getElementById('rec-list');
-    list.innerHTML = '<div class="rec-empty">Loading...</div>';
-    try {
-      const files = await (await fetch('/recordings')).json();
-      if (!files.length) {
-        list.innerHTML = '<div class="rec-empty">No recordings found.</div>';
-        return;
-      }
-      list.innerHTML = '';
-      files.forEach(f => {
-        const el = document.createElement('div');
-        el.className = 'rec-item';
-        el.innerHTML = `
-          <div class="rec-name">${f.name}</div>
-          <div class="rec-meta">
-            <span>${f.size_mb} MB</span>
-            <span>${f.modified}</span>
-          </div>`;
-        el.onclick = () => playRecording(f.name, el);
-        list.appendChild(el);
-      });
-    } catch(e) {
-      list.innerHTML = '<div class="rec-empty">Failed to load recordings.</div>';
-    }
-  }
-
-  function playRecording(filename, el) {
-    document.querySelectorAll('.rec-item').forEach(i => i.classList.remove('selected'));
-    el.classList.add('selected');
-    const player = document.getElementById('rec-player');
-    const placeholder = document.getElementById('player-placeholder');
-    player.src = `/recordings/${filename}`;
-    player.style.display = 'block';
-    placeholder.style.display = 'none';
-    player.play();
-  }
-
-  // ── Restore on reload ──────────────────────────────────────────────────────
-  (async () => {
-    try {
-      const d = await (await fetch('/session/status')).json();
-      if (d.running) {
-        document.getElementById('rtsp-url').value = d.rtsp_url || '';
-        d.labels?.forEach(addTag);
-        setUIState('running');
-        startPolling();
-        showVideo();
-        if (d.saving) setSaveUI(true);
-        if (d.cap_label) {
-          document.getElementById('cap-mode-check').checked = true;
-          document.getElementById('cap-label-input').value  = d.cap_label;
-          document.getElementById('cap-label-wrap').classList.add('visible');
-          showComplianceUI(true);
-        }
-      }
-    } catch(e) {}
-  })();
+  } catch(e) {}
+})();
 </script>
 </body>
 </html>
