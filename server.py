@@ -26,10 +26,22 @@ MODEL_PATH = "/home/paras/sam3/sam3.pt"
 OUTPUT_DIR = "/home/paras/sam3/outputs"
 MAX_FRAMES = None
 
-# YOLO model for person detection.
-# ultralytics auto-downloads this on first use (~22 MB).
-# Upgrade to "yolov8m.pt" or "yolov8l.pt" for better small-object recall.
+# YOLO model for person detection (COCO-trained, auto-downloads ~22 MB).
+# Upgrade to "yolov8m.pt" / "yolov8l.pt" for better small-object recall.
 YOLO_MODEL = "yolov8s.pt"
+
+# YOLOWorld for open-vocabulary cap / hair-net detection (auto-downloads ~50 MB).
+# YOLOWorld is trained on large text-image datasets and understands arbitrary
+# object descriptions — far better calibrated for "hair net" than SAM3 text.
+YOLO_WORLD_MODEL = "yolov8s-worldv2.pt"
+
+# Text synonyms tried for hair-net / cap detection.
+# YOLOWorld runs all of them simultaneously; any match = cap present.
+CAP_SYNONYMS = [
+    "hair net", "hairnet", "hair cap", "head net",
+    "mesh cap", "hair covering", "head covering",
+    "safety cap", "net cap", "hair snood",
+]
 
 # Head crops only for persons whose bbox height is >= this many pixels.
 # Below this the person is too far and the full-frame tile result is used instead.
@@ -349,27 +361,52 @@ def _run_yolo_sahi(frame: np.ndarray, yolo_model,
     return merged.with_nms(threshold=0.45)
 
 
+def _run_yolo_world_caps(frame: np.ndarray, cap_yolo,
+                         conf: float = 0.12) -> sv.Detections:
+    """
+    Run YOLOWorld on `frame` to detect all cap/hair-net regions.
+    cap_yolo must already have set_classes() called with CAP_SYNONYMS.
+    Returns sv.Detections of all found cap boxes (class_id = 0 for all).
+    Used for the full-frame distant-worker fallback.
+    """
+    if cap_yolo is None:
+        return sv.Detections.empty()
+    try:
+        res = cap_yolo(frame, verbose=False, conf=conf)
+        if res and res[0].boxes is not None and len(res[0].boxes):
+            return sv.Detections(
+                xyxy=res[0].boxes.xyxy.cpu().numpy().copy(),
+                confidence=res[0].boxes.conf.cpu().numpy(),
+                class_id=np.zeros(len(res[0].boxes), dtype=int),
+            )
+    except Exception as exc:
+        print(f"[capyolo] error: {exc}")
+    return sv.Detections.empty()
+
+
 def _run_head_crops(frame: np.ndarray, dets: sv.Detections,
+                    cap_yolo,
                     crop_predictor: SAM3SemanticPredictor,
                     labels: list, cap_label: str,
                     width: int, height: int) -> list:
     """
-    For each detected person (from YOLO), run SAM3 on just their head region
-    (top 38% of bbox) to check for a cap.
+    For each YOLO-detected person, run cap detection on the head crop
+    (top 38% of the person bbox).
 
-    SAM3 is called with both a text prompt AND a bounding box covering the
-    full head crop.  This box-prompted mode is significantly more accurate
-    than a plain text scan of the whole frame because:
-      1. The image SAM3 sees IS already the tight head crop.
-      2. The box [0, 0, w, h] tells SAM3's mask decoder to focus on the
-         entire crop rather than hunting for the object globally.
+    Detection priority:
+      1. YOLOWorld on the head crop (primary — open-vocab, fast, accurate).
+         cap_yolo already has set_classes([cap_label] + CAP_SYNONYMS) so it
+         recognises "hair net", "hairnet", "head net", etc. simultaneously.
+      2. SAM3 text-prompted on the head crop (fallback if YOLOWorld absent).
 
     Returns list of (center, has_cap, is_close):
-      has_cap = True/False for close workers, None for distant workers
-                (distant workers fall back to bbox-overlap check).
+      has_cap = True/False for close workers (bbox height >= MIN_CROP_PERSON_HEIGHT)
+      has_cap = None for distant workers (caller falls back to full-frame bbox overlap)
     """
     result = []
-    if not cap_label or crop_predictor is None or dets is None or len(dets) == 0:
+    if not cap_label or dets is None or len(dets) == 0:
+        return result
+    if cap_yolo is None and crop_predictor is None:
         return result
 
     person_cls_ids = {i for i, l in enumerate(labels) if l == "person"}
@@ -390,28 +427,36 @@ def _run_head_crops(frame: np.ndarray, dets: sv.Detections,
             has_cap  = False
             crop_w   = cx2 - cx1
             crop_h   = cy2 - cy1
+
             if crop_w >= 10 and crop_h >= 10:
+                head_crop = _enhance(frame[cy1:cy2, cx1:cx2])
                 try:
-                    head_crop     = _enhance(frame[cy1:cy2, cx1:cx2])
-                    head_crop_pil = PILImage.fromarray(
-                        cv2.cvtColor(head_crop, cv2.COLOR_BGR2RGB))
-                    crop_predictor.set_image(head_crop_pil)
-
-                    # Prefer box-prompted + text (SAM3 box API).
-                    # If the predictor version doesn't accept bboxes kwarg,
-                    # fall back to text-only on the already-cropped image.
-                    try:
-                        crop_res = crop_predictor(
-                            text=[cap_label],
-                            bboxes=[[0, 0, crop_w, crop_h]],
-                        )
-                    except TypeError:
-                        crop_res = crop_predictor(text=[cap_label])
-
-                    has_cap = bool(crop_res and crop_res[0].boxes is not None
-                                   and len(crop_res[0].boxes) > 0)
+                    if cap_yolo is not None:
+                        # ── Primary: YOLOWorld on the head crop ───────────────
+                        # Low conf=0.10 because the crop is already tight and
+                        # we'd rather have a false positive (cap seen) than miss
+                        # a hair net — downstream compliance logic flags violations,
+                        # so false-positives are less harmful than missed caps.
+                        res = cap_yolo(head_crop, verbose=False, conf=0.10)
+                        has_cap = bool(res and res[0].boxes is not None
+                                       and len(res[0].boxes) > 0)
+                    else:
+                        # ── Fallback: SAM3 box-prompted ───────────────────────
+                        head_crop_pil = PILImage.fromarray(
+                            cv2.cvtColor(head_crop, cv2.COLOR_BGR2RGB))
+                        crop_predictor.set_image(head_crop_pil)
+                        try:
+                            crop_res = crop_predictor(
+                                text=[cap_label],
+                                bboxes=[[0, 0, crop_w, crop_h]],
+                            )
+                        except TypeError:
+                            crop_res = crop_predictor(text=[cap_label])
+                        has_cap = bool(crop_res and crop_res[0].boxes is not None
+                                       and len(crop_res[0].boxes) > 0)
                 except Exception as exc:
                     print(f"[crop] error: {exc}")
+
             result.append((_box_center(box), has_cap, True))
             print(f"[crop] close h={person_h}px  has_cap={has_cap}")
         else:
@@ -530,39 +575,53 @@ def detection_loop(rtsp_url: str, labels: list, confidence: float,
 
     # ── Models ────────────────────────────────────────────────────────────────
     #
-    # Person detection  → YOLO (COCO-trained, purpose-built for this task).
-    #   YOLO is dramatically better than SAM3 text-prompting for locating
-    #   persons: it was trained on 118k images with explicit person labels,
-    #   handles motion/distance well, and runs ~10× faster per frame.
+    # Person detection  → YOLO (yolov8s.pt, COCO-trained)
+    #   Purpose-built for detection, handles motion/distance well, fast.
     #
-    # Cap detection     → SAM3 (open-vocabulary semantic segmentation).
-    #   SAM3 is kept for cap detection because there is no COCO class for
-    #   "transparent safety cap". Its text-understanding allows zero-shot
-    #   detection of objects YOLO has never been trained on.  It runs only
-    #   on the tight head crop, not the whole frame.
+    # Cap / hair-net    → YOLOWorld (yolov8s-worldv2.pt, open-vocabulary)
+    #   Set with CAP_SYNONYMS so it recognises "hair net", "hairnet",
+    #   "head net", "mesh cap", etc. simultaneously.  Also used for the
+    #   full-frame cap scan that handles distant workers.
+    #
+    # SAM3              → fallback cap predictor only if YOLOWorld absent.
     #
     print(f"[yolo] loading {YOLO_MODEL} for person detection…")
     yolo_model = YOLO(YOLO_MODEL)
-    # Warm up so first-frame latency doesn't spike
     _dummy = np.zeros((64, 64, 3), dtype=np.uint8)
     yolo_model(_dummy, verbose=False)
     print("[yolo] ready")
 
-    # Ensure "person" is always at index 0 in the labels list so class_id=0
-    # (what YOLO returns for persons) maps correctly in the compliance check.
+    # Ensure "person" is always at index 0 so YOLO's class_id=0 maps correctly.
     if "person" not in labels:
         labels = ["person"] + labels
     person_label_idx = labels.index("person")
 
+    cap_yolo = None
     crop_predictor = None
     if cap_mode:
-        crop_conf = max(confidence * 0.65, 0.15)
-        print(f"[sam3] loading head-crop predictor (imgsz=384, conf={crop_conf:.2f})…")
-        crop_predictor = SAM3SemanticPredictor(overrides=dict(
-            conf=crop_conf, task="segment", mode="predict",
-            model=MODEL_PATH, half=True, imgsz=384, verbose=False,
-        ))
-    print("[sam3] cap predictor ready")
+        # YOLOWorld: primary cap/hair-net detector
+        try:
+            from ultralytics import YOLOWorld
+            print(f"[yoloworld] loading {YOLO_WORLD_MODEL} for cap detection…")
+            cap_yolo = YOLOWorld(YOLO_WORLD_MODEL)
+            # Combine user cap_label with common synonyms for maximum recall
+            classes = list(dict.fromkeys([cap_label] + CAP_SYNONYMS))
+            cap_yolo.set_classes(classes)
+            cap_yolo(_dummy, verbose=False)   # warm up
+            print(f"[yoloworld] ready  classes={classes}")
+        except Exception as exc:
+            print(f"[yoloworld] unavailable ({exc}) — falling back to SAM3 for cap detection")
+            cap_yolo = None
+
+        if cap_yolo is None:
+            # SAM3 fallback for cap detection
+            crop_conf = max(confidence * 0.65, 0.15)
+            print(f"[sam3] loading head-crop predictor (imgsz=512, conf={crop_conf:.2f})…")
+            crop_predictor = SAM3SemanticPredictor(overrides=dict(
+                conf=crop_conf, task="segment", mode="predict",
+                model=MODEL_PATH, half=True, imgsz=512, verbose=False,
+            ))
+            print("[sam3] cap predictor ready")
 
     # ── Real-ESRGAN (optional) ─────────────────────────────────────────────────
     # Load once here so the weight file is downloaded before the stream starts.
@@ -620,6 +679,7 @@ def detection_loop(rtsp_url: str, labels: list, confidence: float,
         "running":   True,
         "frame":     None,
         "dets":      sv.Detections.empty(),
+        "cap_dets":  sv.Detections.empty(),   # full-frame cap boxes (distant workers)
         "head_caps": [],
         "lock":      threading.Lock(),
         "event":     threading.Event(),
@@ -638,8 +698,6 @@ def detection_loop(rtsp_url: str, labels: list, confidence: float,
             t0 = time.time()
 
             # ── YOLO person detection (with optional SR pre-pass) ─────────────
-            # If Real-ESRGAN is available, upscale once so YOLO sees a 2×
-            # resolution frame; boxes are scaled back to original coords.
             if upsampler is not None:
                 t_sr = time.time()
                 f_sr = _apply_sr(f, upsampler)
@@ -657,14 +715,24 @@ def detection_loop(rtsp_url: str, labels: list, confidence: float,
                 dets = _run_yolo_sahi(f, yolo_model, n_cols, n_rows,
                                       person_label_idx=person_label_idx)
 
-            # ── SAM3 cap detection on head crops ──────────────────────────────
-            hcaps = _run_head_crops(f, dets, crop_predictor, labels,
-                                    cap_label, width, height)
+            # ── YOLOWorld full-frame cap scan (distant-worker fallback) ────────
+            # For workers whose bbox is too small for a reliable head crop,
+            # the compliance check falls back to whether any cap box overlaps
+            # the top of their person box.  Run YOLOWorld on the full frame
+            # once to get those cap boxes.
+            cap_dets = sv.Detections.empty()
+            if cap_mode:
+                cap_dets = _run_yolo_world_caps(f, cap_yolo)
 
-            print(f"[infer] {len(dets)} dets  {len(hcaps)} crops  "
-                  f"{(time.time()-t0)*1000:.0f} ms")
+            # ── Per-crop cap detection (close workers) ─────────────────────────
+            hcaps = _run_head_crops(f, dets, cap_yolo, crop_predictor,
+                                    labels, cap_label, width, height)
+
+            print(f"[infer] persons={len(dets)}  caps_ff={len(cap_dets)}  "
+                  f"crops={len(hcaps)}  {(time.time()-t0)*1000:.0f} ms")
             with infer["lock"]:
                 infer["dets"]      = dets
+                infer["cap_dets"]  = cap_dets
                 infer["head_caps"] = hcaps
 
     infer_thread = threading.Thread(target=_inference_worker, daemon=True)
@@ -719,7 +787,8 @@ def detection_loop(rtsp_url: str, labels: list, confidence: float,
 
             # ── Read latest inference results (non-blocking) ──────────────────
             with infer["lock"]:
-                last_sv_dets        = infer["dets"]
+                last_sv_dets         = infer["dets"]
+                last_cap_dets        = infer["cap_dets"]    # full-frame cap boxes
                 last_head_cap_status = infer["head_caps"]
 
             # ── ByteTrack every frame ─────────────────────────────────────────
@@ -757,14 +826,19 @@ def detection_loop(rtsp_url: str, labels: list, confidence: float,
                 conf_arr = tracked.confidence if tracked.confidence is not None else np.ones(n)
 
                 person_cls = {i for i, l in enumerate(labels) if l == "person"}
-                cap_cls    = {i for i, l in enumerate(labels) if l == cap_label}
-                cap_boxes_ff = [tracked.xyxy[i] for i in range(n) if cls_arr[i] in cap_cls]
+
+                # Cap boxes from YOLOWorld full-frame scan (distant-worker fallback).
+                # last_cap_dets contains boxes detected by YOLOWorld on the whole
+                # frame — these are used for workers too far away for a head crop.
+                cap_boxes_ff = (list(last_cap_dets.xyxy)
+                                if last_cap_dets is not None and len(last_cap_dets) > 0
+                                else [])
 
                 def _has_cap(tracked_box) -> bool:
                     tc    = _box_center(tracked_box)
                     max_d = (tracked_box[2] - tracked_box[0]) * 0.9
 
-                    # 1. Head-crop result (close workers)
+                    # 1. Head-crop YOLOWorld result (close workers)
                     if last_head_cap_status:
                         best_d, best_v, best_close = float('inf'), None, False
                         for center, hc, is_close in last_head_cap_status:
@@ -774,7 +848,7 @@ def detection_loop(rtsp_url: str, labels: list, confidence: float,
                         if best_close and best_v is not None and best_d < max_d:
                             return best_v
 
-                    # 2. Full-frame bbox overlap (distant workers)
+                    # 2. Full-frame YOLOWorld cap bbox overlap (distant workers)
                     return _person_has_cap_bbox(tracked_box, cap_boxes_ff)
 
                 for i in range(n):
