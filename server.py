@@ -487,22 +487,31 @@ def _enhance(img: np.ndarray, level: str = "normal") -> np.ndarray:
         return cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
 
 
-# ── Post-inference confidence filter ──────────────────────────────────────────
-# The model is loaded with a permissive base threshold so low-light detections
-# (whose text-visual similarity scores are naturally depressed) are not dropped
-# inside the network.  We re-gate here at a brightness-aware threshold.
+# ── Per-frame dynamic confidence for dark conditions ──────────────────────────
+# SAM3's text-visual similarity scores are naturally depressed when the input
+# is dark or noisy, so the same hard threshold misses real detections.
+# We lower the predictor's threshold before running on dark frames (each session
+# owns its predictor, so this is thread-safe) and restore it afterwards.
+# NOTE: we do NOT use a globally permissive base_conf at init time because that
+# causes SAM3's internal NMS to see far more candidate boxes, allowing low-conf
+# false positives to suppress real detections via IoU overlap.
 
-def _filter_conf(dets: sv.Detections, min_conf: float) -> sv.Detections:
-    if len(dets) == 0:
-        return dets
-    mask = dets.confidence >= min_conf
-    if not mask.any():
-        return sv.Detections.empty()
-    return sv.Detections(
-        xyxy=dets.xyxy[mask],
-        confidence=dets.confidence[mask],
-        class_id=dets.class_id[mask],
-    )
+# Scale factors per lighting level: user conf × factor = actual threshold used
+_CONF_SCALE = {"normal": 1.00, "low": 0.80, "very_low": 0.60, "night": 0.45}
+
+
+def _set_predictor_conf(predictor, conf: float):
+    """Best-effort in-place update of the SAM3 predictor's confidence threshold."""
+    try:
+        if hasattr(predictor, "args"):
+            predictor.args.conf = conf
+        if hasattr(predictor, "overrides"):
+            predictor.overrides["conf"] = conf
+        if hasattr(predictor, "model") and hasattr(predictor.model, "predictor"):
+            if hasattr(predictor.model.predictor, "args"):
+                predictor.model.predictor.args.conf = conf
+    except Exception:
+        pass  # best-effort; original conf remains if anything fails
 
 
 # ── SAHI: tiled inference ─────────────────────────────────────────────────────
@@ -611,17 +620,13 @@ def detection_loop(sess: dict, confidence: float, every_n: int):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     # ── Load SAM3 (one instance per session) ──────────────────────────────────
-    # Set a permissive base threshold so the model returns weaker matches that
-    # only appear in low-light conditions.  We re-gate with _filter_conf() below
-    # using a brightness-adaptive threshold so daytime precision is unchanged.
     print(f"[sam3][{sid[:8]}] loading model...")
-    base_conf = max(0.15, confidence * 0.55)
     overrides = dict(
-        conf=base_conf, task="segment", mode="predict",
+        conf=confidence, task="segment", mode="predict",
         model=MODEL_PATH, half=True, imgsz=1280, verbose=False,
     )
     predictor = SAM3SemanticPredictor(overrides=overrides)
-    print(f"[sam3][{sid[:8]}] model loaded  (base_conf={base_conf:.2f}, user_conf={confidence:.2f})")
+    print(f"[sam3][{sid[:8]}] model loaded  (conf={confidence:.2f})")
 
     # Shared Real-ESRGAN (lazy init, loaded once for all sessions)
     upsampler, sr_outscale = _get_realesrgan()
@@ -721,7 +726,15 @@ def detection_loop(sess: dict, confidence: float, every_n: int):
                 else:
                     n_cols, n_rows = BASE_GRID
 
-                # ── 4. Super-resolution ────────────────────────────────────────
+                # ── 4. Dynamic confidence for dark frames ──────────────────
+                # Lower the predictor's threshold before running on dark frames
+                # so depressed text-visual similarity scores aren't silently
+                # discarded inside SAM3.  Restored immediately after.
+                eff_conf = confidence * _CONF_SCALE[level]
+                if level != "normal":
+                    _set_predictor_conf(predictor, eff_conf)
+
+                # ── 5. Super-resolution ────────────────────────────────────────
                 if upsampler is not None:
                     f_sr = _apply_sr(f_proc, upsampler, outscale=sr_outscale)
                     sx   = f_proc.shape[1] / f_sr.shape[1]
@@ -730,7 +743,7 @@ def detection_loop(sess: dict, confidence: float, every_n: int):
                     f_sr = f_proc
                     sx   = sy = 1.0
 
-                # ── 5. SAHI on SR frame ────────────────────────────────────────
+                # ── 6. SAHI on SR frame ────────────────────────────────────────
                 sahi_dets = _run_sahi(f_sr, predictor, labels,
                                       n_cols, n_rows, level=level)
                 if len(sahi_dets) > 0 and upsampler is not None:
@@ -740,15 +753,13 @@ def detection_loop(sess: dict, confidence: float, every_n: int):
                         class_id=sahi_dets.class_id,
                     )
 
-                # ── 6. Full-frame pass on original ────────────────────────────
-                # Catches objects split across tile boundaries.
+                # ── 7. Full-frame pass on original ────────────────────────────
                 full_dets = _infer_full_frame(f_proc, predictor, labels, level)
 
-                # ── 7. TTA: horizontal flip ───────────────────────────────────
-                # Run on flipped frame and mirror boxes back.  Improves recall
-                # for workers near tile edges and for objects in low-contrast
-                # regions.  Adds one extra SAM3 call (~0.15s) — worth it at
-                # night when recall matters more than latency.
+                # ── 8. TTA: horizontal flip ───────────────────────────────────
+                # Adds one extra SAM3 call for low/dark frames.  Objects near
+                # tile boundaries or with asymmetric shadows become detectable
+                # from the mirrored view.
                 if level in ("low", "very_low", "night"):
                     fw_  = f_proc.shape[1]
                     f_fl = cv2.flip(f_proc, 1)
@@ -764,23 +775,17 @@ def detection_loop(sess: dict, confidence: float, every_n: int):
                 else:
                     fl_dets = sv.Detections.empty()
 
-                # ── 8. Merge all passes ────────────────────────────────────────
-                raw_dets = _merge(sahi_dets, full_dets, fl_dets)
+                # ── 9. Restore original confidence + merge ─────────────────────
+                if level != "normal":
+                    _set_predictor_conf(predictor, confidence)
 
-                # ── 9. Adaptive confidence gate ───────────────────────────────
-                # Scale the user's threshold down for dark conditions so weak
-                # matches (whose scores are depressed by poor image quality)
-                # are not silently dropped.
-                conf_map = {"normal": 1.00, "low": 0.80,
-                            "very_low": 0.65, "night": 0.50}
-                eff_conf = confidence * conf_map[level]
-                dets     = _filter_conf(raw_dets, eff_conf)
+                dets = _merge(sahi_dets, full_dets, fl_dets)
 
                 print(f"[infer][{sid[:8]}] fid={fid} level={level} "
-                      f"grid={n_cols}×{n_rows} sahi={len(sahi_dets)} "
-                      f"full={len(full_dets)} flip={len(fl_dets)} "
-                      f"raw={len(raw_dets)} final={len(dets)} "
-                      f"conf≥{eff_conf:.2f}  {(time.time()-t0)*1000:.0f} ms")
+                      f"conf={eff_conf:.2f} grid={n_cols}×{n_rows} "
+                      f"sahi={len(sahi_dets)} full={len(full_dets)} "
+                      f"flip={len(fl_dets)} final={len(dets)} "
+                      f"{(time.time()-t0)*1000:.0f} ms")
             except Exception as exc:
                 print(f"[infer][{sid[:8]}] error: {exc}")
                 import traceback; traceback.print_exc()
