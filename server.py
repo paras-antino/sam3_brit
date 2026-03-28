@@ -680,53 +680,85 @@ def _merge(*dets_list) -> sv.Detections:
 
 
 def _compliance_check(dets: sv.Detections, all_labels: list,
-                      required_labels: list) -> list:
+                      required_labels: list,
+                      frame_shape: tuple = (1080, 1920, 3)) -> list:
     """
     Returns a list of violation dicts for persons not wearing every required item.
     Each violation: {"xyxy": [x1,y1,x2,y2], "missing": ["cap","gloves"]}
 
-    Strategy: a required item is considered "on" a person if its centre point
-    falls within that person's bounding box (with a 15% margin outward).
+    Person boxes are filtered strictly before association to eliminate false positives:
+      - Must be portrait-shaped (height >= width * 0.8)
+      - Must cover at least 2% of frame area
+      - Must have confidence >= 0.38
+      - Duplicate/overlapping person boxes collapsed with tight NMS (0.30)
     """
     if len(dets) == 0:
         return []
 
-    person_idx  = [i for i, l in enumerate(all_labels) if l == "person"]
+    person_idx = [i for i, l in enumerate(all_labels) if l == "person"]
     if not person_idx:
         return []
-    person_cls  = set(person_idx)
+    person_cls = set(person_idx)
 
-    # Indices in all_labels for required items
-    req_cls_map: dict[str, list[int]] = {}
-    for lbl in required_labels:
-        idxs = [i for i, l in enumerate(all_labels) if l == lbl]
-        if idxs:
-            req_cls_map[lbl] = idxs
-
-    if not req_cls_map:
+    if not any(lbl in all_labels for lbl in required_labels):
         return []
 
+    fh, fw = frame_shape[:2]
+    frame_area = max(fh * fw, 1)
+
     class_ids   = dets.class_id   if dets.class_id   is not None else []
+    confidences = dets.confidence if dets.confidence is not None else [1.0] * len(dets)
     xyxys       = dets.xyxy
 
-    # Separate person boxes from target boxes
-    person_boxes = [(i, xyxys[i]) for i, c in enumerate(class_ids) if c in person_cls]
-    target_boxes = [(i, xyxys[i], all_labels[c] if c < len(all_labels) else "?")
-                    for i, c in enumerate(class_ids) if c not in person_cls]
+    # ── Collect & filter person boxes ────────────────────────────────────────
+    raw_persons = []
+    for i, c in enumerate(class_ids):
+        if c not in person_cls:
+            continue
+        pb = xyxys[i]
+        x1, y1, x2, y2 = pb
+        bw, bh = max(x2 - x1, 1), max(y2 - y1, 1)
 
+        # 1. Must be portrait or at least squarish (not landscape)
+        if bh < bw * 0.8:
+            continue
+        # 2. Must cover ≥2% of frame (eliminates distant/tiny false detections)
+        if (bw * bh) / frame_area < 0.02:
+            continue
+        # 3. Confidence floor — persons need 0.38 minimum
+        if float(confidences[i]) < 0.38:
+            continue
+
+        raw_persons.append((pb, float(confidences[i])))
+
+    if not raw_persons:
+        return []
+
+    # ── Collapse duplicate person boxes (same person from multiple SAHI tiles) ─
+    # Tight NMS at 0.30 IoU ensures we keep one box per real person
+    p_xyxy = np.array([p[0] for p in raw_persons])
+    p_conf = np.array([p[1] for p in raw_persons])
+    keep = sv.box_non_max_suppression(p_xyxy, p_conf, 0.30)
+    person_boxes = [raw_persons[k][0] for k in keep]
+
+    # ── Target boxes ──────────────────────────────────────────────────────────
+    target_boxes = [(xyxys[i], all_labels[c] if c < len(all_labels) else "?")
+                    for i, c in enumerate(class_ids)
+                    if c not in person_cls]
+
+    # ── Association ───────────────────────────────────────────────────────────
     violations = []
-    for _, pb in person_boxes:
+    for pb in person_boxes:
         px1, py1, px2, py2 = pb
         pw, ph = px2 - px1, py2 - py1
-        # 15% margin: expand person box outward for association
-        mx1 = px1 - pw * 0.15
-        my1 = py1 - ph * 0.15
-        mx2 = px2 + pw * 0.15
-        my2 = py2 + ph * 0.15
+        # Expand person box 20% outward — cap extends above head, gloves beside hip
+        mx1 = px1 - pw * 0.20
+        my1 = py1 - ph * 0.20
+        mx2 = px2 + pw * 0.20
+        my2 = py2 + ph * 0.20
 
         found_labels = set()
-        for _, tb, tlbl in target_boxes:
-            # Use centre point of target box
+        for tb, tlbl in target_boxes:
             cx = (tb[0] + tb[2]) / 2
             cy = (tb[1] + tb[3]) / 2
             if mx1 <= cx <= mx2 and my1 <= cy <= my2:
@@ -1204,7 +1236,8 @@ def detection_loop(sess: dict, confidence: float, every_n: int,
             # ── Compliance check ───────────────────────────────────────────────
             _violations = []
             if compliance_mode and len(tracked) > 0:
-                _violations = _compliance_check(tracked, labels, required_labels)
+                _violations = _compliance_check(tracked, labels, required_labels,
+                                                frame_shape=display_frame.shape)
                 if _violations:
                     annotated = _draw_compliance(annotated, _violations)
             with sess["_lock"]:
