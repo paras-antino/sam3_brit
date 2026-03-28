@@ -991,10 +991,13 @@ function resetZoom(sid) { if(!streams[sid]) return; const s = streams[sid]; s.zo
 function toggleFullscreen(sid) {
   const wrap = document.getElementById(`wrap-${CSS.escape(sid)}`);
   if (!wrap) return;
-  if (!document.fullscreenElement && !document.webkitFullscreenElement) {
-    (wrap.requestFullscreen || wrap.webkitRequestFullscreen).call(wrap);
+  const isFs = document.fullscreenElement || document.webkitFullscreenElement;
+  if (!isFs) {
+    if      (wrap.requestFullscreen)       wrap.requestFullscreen();
+    else if (wrap.webkitRequestFullscreen) wrap.webkitRequestFullscreen();
   } else {
-    (document.exitFullscreen || document.webkitExitFullscreen).call(document);
+    if      (document.exitFullscreen)       document.exitFullscreen();
+    else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
   }
 }
 // Update fullscreen button icon when state changes

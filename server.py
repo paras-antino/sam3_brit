@@ -738,8 +738,12 @@ def _compliance_check(dets: sv.Detections, all_labels: list,
     # Tight NMS at 0.30 IoU ensures we keep one box per real person
     p_xyxy = np.array([p[0] for p in raw_persons])
     p_conf = np.array([p[1] for p in raw_persons])
-    keep = sv.box_non_max_suppression(p_xyxy, p_conf, 0.30)
-    person_boxes = [raw_persons[k][0] for k in keep]
+    p_dets = sv.Detections(
+        xyxy=p_xyxy,
+        confidence=p_conf,
+        class_id=np.zeros(len(p_xyxy), dtype=int),
+    ).with_nms(threshold=0.30)
+    person_boxes = p_dets.xyxy.tolist()
 
     # ── Target boxes ──────────────────────────────────────────────────────────
     target_boxes = [(xyxys[i], all_labels[c] if c < len(all_labels) else "?")
@@ -1308,7 +1312,9 @@ def detection_loop(sess: dict, confidence: float, every_n: int,
     except Exception as exc:
         with sess["_lock"]:
             sess["error"] = str(exc)
+        import traceback
         print(f"[loop][{sid[:8]}] ERROR: {exc}")
+        traceback.print_exc()
     finally:
         infer["running"] = False
         infer["event"].set()
@@ -1356,8 +1362,11 @@ def _run_enhance_job(job_id: str, filename: str, labels: list,
         use_sr    = quality != "mild"
         force_tta = quality == "maximum"
 
-        # Load SAM3 for this job
-        predictor = SAM3SemanticPredictor(MODEL_PATH)
+        # Load SAM3 for this job (same overrides as detection_loop)
+        predictor = SAM3SemanticPredictor(overrides=dict(
+            conf=confidence, task="segment", mode="predict",
+            model=MODEL_PATH, half=True, imgsz=896, verbose=False,
+        ))
         predictor.set_classes(labels)
         _set_predictor_conf(predictor, confidence)
 
@@ -1444,10 +1453,7 @@ def _run_enhance_job(job_id: str, filename: str, labels: list,
 
             # 9. Merge + NMS
             _set_predictor_conf(predictor, confidence)
-            dets = sv.Detections.merge([sahi_dets, full_dets, fl_dets])
-            if len(dets) > 0:
-                keep = sv.box_non_max_suppression(dets.xyxy, dets.confidence or np.ones(len(dets)), 0.45)
-                dets = dets[keep]
+            dets = _merge(sahi_dets, full_dets, fl_dets)
 
             # Draw on original-res frame (not SR'd)
             out_frame = frame.copy()
