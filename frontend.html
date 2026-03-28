@@ -221,6 +221,25 @@ header {
   border-radius: 4px; display: flex; align-items: center; justify-content: center;
 }
 
+/* Fullscreen */
+.stream-video-wrap:fullscreen,
+.stream-video-wrap:-webkit-full-screen {
+  aspect-ratio: unset; width: 100vw; height: 100vh;
+  border-radius: 0; background: #000;
+}
+.stream-video-wrap:fullscreen .stream-feed,
+.stream-video-wrap:-webkit-full-screen .stream-feed {
+  width: 100%; height: 100%; object-fit: contain;
+}
+.stream-video-wrap:fullscreen .zoom-bar,
+.stream-video-wrap:-webkit-full-screen .zoom-bar { bottom: 16px; right: 16px; }
+
+/* LOST toggle button */
+.act-btn.lost-on {
+  border-color: rgba(245,158,11,.5); color: var(--amber);
+  background: rgba(245,158,11,.1);
+}
+
 /* Stream info */
 .stream-info { padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; }
 
@@ -675,7 +694,7 @@ async function addStream() {
     if (!res.ok) { showDrawerError(data.detail || 'Failed to start.'); btn.disabled = false; btn.textContent = '▶  Start Stream'; return; }
 
     const finalSid = data.session_id;
-    streams[finalSid] = { labels: [...drawerTags], saving: save, zoom: 1, panX: 0, panY: 0, dragging: false };
+    streams[finalSid] = { labels: [...drawerTags], saving: save, show_lost: false, zoom: 1, panX: 0, panY: 0, dragging: false };
 
     createStreamCard(finalSid, rtsp, drawerTags, save);
     updateStreamCountLabel();
@@ -758,6 +777,7 @@ function createStreamCard(sid, rtspUrl, labels, saving) {
         <div class="zbtn-level" id="zlevel-${CSS.escape(sid)}">1×</div>
         <button class="zbtn" onclick="zoomOut('${sid}')" title="Zoom out">−</button>
         <button class="zbtn" onclick="resetZoom('${sid}')" title="Reset">⊙</button>
+        <button class="zbtn" onclick="toggleFullscreen('${sid}')" id="fsbtn-${CSS.escape(sid)}" title="Fullscreen">⛶</button>
       </div>
     </div>
 
@@ -765,6 +785,10 @@ function createStreamCard(sid, rtspUrl, labels, saving) {
       <div class="stream-row1">
         <span class="stream-name" title="${sid}">${sid}</span>
         <div class="stream-actions">
+          <button class="act-btn" id="lostbtn-${CSS.escape(sid)}"
+                  onclick="toggleLost('${sid}')" title="Show/hide lost tracks">
+            ◌ Lost
+          </button>
           <button class="act-btn ${saving ? 'rec-on' : ''}" id="recbtn-${CSS.escape(sid)}"
                   onclick="toggleRecord('${sid}')">
             ${saving ? '⏹ Stop Rec' : '⏺ Record'}
@@ -839,6 +863,11 @@ async function pollAll() {
       if (d.saving !== streams[d.id].saving) {
         streams[d.id].saving = d.saving;
         updateRecBtn(d.id, d.saving);
+      }
+      if (typeof d.show_lost !== 'undefined' &&
+          d.show_lost !== streams[d.id].show_lost) {
+        streams[d.id].show_lost = d.show_lost;
+        updateLostBtn(d.id, d.show_lost);
       }
       if (!d.running) removeStreamCard(d.id);
     });
@@ -932,6 +961,52 @@ function zoomIn(sid)    { if(!streams[sid]) return; streams[sid].zoom = Math.min
 function zoomOut(sid)   { if(!streams[sid]) return; const s = streams[sid]; s.zoom = Math.max(1, s.zoom/1.4); if(s.zoom<=1){s.panX=0;s.panY=0;} applyZoom(sid); }
 function resetZoom(sid) { if(!streams[sid]) return; const s = streams[sid]; s.zoom=1;s.panX=0;s.panY=0; applyZoom(sid); }
 
+// ── Fullscreen ────────────────────────────────────────────
+function toggleFullscreen(sid) {
+  const wrap = document.getElementById(`wrap-${CSS.escape(sid)}`);
+  if (!wrap) return;
+  if (!document.fullscreenElement && !document.webkitFullscreenElement) {
+    (wrap.requestFullscreen || wrap.webkitRequestFullscreen).call(wrap);
+  } else {
+    (document.exitFullscreen || document.webkitExitFullscreen).call(document);
+  }
+}
+// Update fullscreen button icon when state changes
+document.addEventListener('fullscreenchange', _onFsChange);
+document.addEventListener('webkitfullscreenchange', _onFsChange);
+function _onFsChange() {
+  // Reset all first
+  document.querySelectorAll('[id^="fsbtn-"]').forEach(b => b.textContent = '⛶');
+  const el = document.fullscreenElement || document.webkitFullscreenElement;
+  if (el && el.id && el.id.startsWith('wrap-')) {
+    const sid = el.id.slice(5); // strip "wrap-"
+    const btn = document.getElementById(`fsbtn-${CSS.escape(sid)}`);
+    if (btn) btn.textContent = '✕';
+  }
+}
+
+// ── Lost tracks toggle ────────────────────────────────────
+async function toggleLost(sid) {
+  try {
+    const res  = await fetch(`/session/${encodeURIComponent(sid)}/show_lost`, { method: 'POST' });
+    const data = await res.json();
+    updateLostBtn(sid, data.show_lost);
+  } catch(e) {}
+}
+function updateLostBtn(sid, active) {
+  const btn = document.getElementById(`lostbtn-${CSS.escape(sid)}`);
+  if (!btn) return;
+  if (active) {
+    btn.classList.add('lost-on');
+    btn.innerHTML = '◉ Lost';
+    btn.title = 'Lost tracks visible — click to hide';
+  } else {
+    btn.classList.remove('lost-on');
+    btn.innerHTML = '◌ Lost';
+    btn.title = 'Show lost tracks';
+  }
+}
+
 // ══════════════════════════════════════════════════════════
 //  Resources (header pills)
 // ══════════════════════════════════════════════════════════
@@ -995,8 +1070,9 @@ function showDrawerError(msg) {
     if (!sessions.length) return;
     sessions.forEach(d => {
       if (!d.running) return;
-      streams[d.id] = { labels: d.labels || [], saving: d.saving, zoom: 1, panX: 0, panY: 0, dragging: false };
+      streams[d.id] = { labels: d.labels || [], saving: d.saving, show_lost: d.show_lost || false, zoom: 1, panX: 0, panY: 0, dragging: false };
       createStreamCard(d.id, d.rtsp_url || '', d.labels || [], d.saving);
+      if (d.show_lost) updateLostBtn(d.id, true);
     });
     updateStreamCountLabel();
     if (Object.keys(streams).length && !pollTimer) pollTimer = setInterval(pollAll, 1500);

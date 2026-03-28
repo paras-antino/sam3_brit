@@ -105,6 +105,7 @@ def _make_session(sid: str, rtsp_url: str, labels: list, saving: bool) -> dict:
         "_wlock":      threading.Lock(),
         "_lock":       threading.Lock(),
         "_thread":     None,
+        "show_lost":   False,   # ghost tracks hidden by default
     }
 
 
@@ -122,6 +123,7 @@ def _session_public(sess: dict) -> dict:
         "error":       sess["error"],
         "saving":      sess["saving"],
         "save_path":   sess["save_path"],
+        "show_lost":   sess.get("show_lost", False),
     }
 
 
@@ -1089,8 +1091,9 @@ def detection_loop(sess: dict, confidence: float, every_n: int,
             if label_texts:
                 annotated = lbl_ann.annotate(annotated, tracked, labels=label_texts)
 
-            # Draw ghost tracks — amber dashed-style box
-            for tid, g in ghost_tracks.items():
+            # Draw ghost tracks — amber dashed-style box (only if enabled)
+            _show_lost = sess.get("show_lost", False)
+            for tid, g in (ghost_tracks.items() if _show_lost else []):
                 x1, y1, x2, y2 = [int(v) for v in g["xyxy"]]
                 # Fade opacity based on remaining TTL
                 alpha = min(1.0, g["ttl"] / (_GHOST_TTL * 0.3))
@@ -1432,6 +1435,15 @@ def toggle_save(session_id: str, req: SaveRequest):
             raise HTTPException(400, "Session is not running.")
         sess["saving"] = req.save
     return {"status": "saving" if req.save else "not saving", "session_id": session_id}
+
+
+@app.post("/session/{session_id}/show_lost")
+def toggle_show_lost(session_id: str):
+    sess = _get_session(session_id)
+    with sess["_lock"]:
+        sess["show_lost"] = not sess.get("show_lost", False)
+        current = sess["show_lost"]
+    return {"show_lost": current, "session_id": session_id}
 
 
 @app.get("/session/{session_id}/status")
