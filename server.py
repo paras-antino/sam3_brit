@@ -744,11 +744,25 @@ def detection_loop(sess: dict, confidence: float, every_n: int,
     predictor = SAM3SemanticPredictor(overrides=overrides)
     print(f"[sam3][{sid[:8]}] model loaded  (conf={confidence:.2f})")
 
-    # Quality preset flags
-    _q_use_sr    = quality != "fast"          # fast skips ESRGAN entirely
-    _q_force_tta = quality == "maximum"       # maximum: TTA on every frame
-    _q_force_blend = quality == "maximum"     # maximum: temporal blend on every frame
-    print(f"[quality][{sid[:8]}] preset={quality}  SR={_q_use_sr}  force_tta={_q_force_tta}")
+    # ── Quality preset — each level is meaningfully different ────────────────
+    # fast:     2×2 SAHI, no SR, no TTA,  overlap=0.10  → lowest GPU, fastest
+    # balanced: 3×3 SAHI, SR,   TTA dark, overlap=0.20  → default
+    # maximum:  4×4 SAHI, SR,   TTA always, overlap=0.30,
+    #           confidence*0.85 to surface weak detections → best recall
+    _q_use_sr      = quality != "fast"
+    _q_force_tta   = quality == "maximum"
+    _q_force_blend = quality == "maximum"
+    _Q_GRID  = {"fast": (2, 2), "balanced": (3, 3), "maximum": (4, 4)}
+    _Q_OVL   = {"fast": 0.10,   "balanced": 0.20,   "maximum": 0.30}
+    _Q_CSCALE= {"fast": 1.00,   "balanced": 1.00,   "maximum": 0.85}
+    _q_base_grid  = _Q_GRID.get(quality, (3, 3))
+    _q_overlap    = _Q_OVL.get(quality, 0.20)
+    _q_conf_scale = _Q_CSCALE.get(quality, 1.00)
+    sr_status = "disabled (not installed)" if upsampler is None else ("enabled" if _q_use_sr else "skipped (fast mode)")
+    print(f"[quality][{sid[:8]}] preset={quality}  grid={_q_base_grid}  "
+          f"overlap={_q_overlap}  SR={sr_status}  "
+          f"TTA={'always' if _q_force_tta else 'dark-only'}  "
+          f"conf_scale={_q_conf_scale}")
 
     # Shared Real-ESRGAN (lazy init, loaded once for all sessions)
     upsampler, sr_outscale = _get_realesrgan()
@@ -791,11 +805,7 @@ def detection_loop(sess: dict, confidence: float, every_n: int,
         return
     print(f"[rtsp][{sid[:8]}] {width}x{height} @ {stream_fps:.1f} fps")
 
-    # Base grid — overridden per-frame in the inference worker based on brightness.
-    # night/very_low → 4×4 (more tiles = higher effective resolution for small objects)
-    # low/normal     → 3×3
-    BASE_GRID = (3, 3)
-    print(f"[sahi][{sid[:8]}] adaptive grid: 3×3 normal / 4×4 dark")
+    print(f"[sahi][{sid[:8]}] base grid={_q_base_grid} (dark frames always upgrade to 4×4)")
 
     # ── Open writers if save was requested at start ────────────────────────────
     with sess["_lock"]:
@@ -845,13 +855,16 @@ def detection_loop(sess: dict, confidence: float, every_n: int,
                     f_proc = f
 
                 # ── 3. Adaptive SAHI grid ──────────────────────────────────────
-                if quality == "maximum" or level in ("very_low", "night"):
+                # Quality sets the base; dark scenes always upgrade to at least 4×4
+                if level in ("very_low", "night"):
                     n_cols, n_rows = 4, 4
                 else:
-                    n_cols, n_rows = BASE_GRID
+                    n_cols, n_rows = _q_base_grid
 
-                # ── 4. Dynamic confidence for dark frames ──────────────────────
-                eff_conf = confidence * _CONF_SCALE[level]
+                # ── 4. Dynamic confidence ──────────────────────────────────────
+                # Dark scenes lower conf to surface weak detections.
+                # Maximum quality also lowers it to improve recall in good light.
+                eff_conf = confidence * _CONF_SCALE[level] * _q_conf_scale
                 if level != "normal":
                     _set_predictor_conf(predictor, eff_conf)
 
@@ -866,7 +879,8 @@ def detection_loop(sess: dict, confidence: float, every_n: int,
 
                 # ── 6. SAHI on SR frame ────────────────────────────────────────
                 sahi_dets = _run_sahi(f_sr, predictor, labels,
-                                      n_cols, n_rows, level=level)
+                                      n_cols, n_rows,
+                                      overlap=_q_overlap, level=level)
                 if len(sahi_dets) > 0 and upsampler is not None:
                     sahi_dets = sv.Detections(
                         xyxy=_scale_boxes(sahi_dets.xyxy, sx, sy),
@@ -1236,10 +1250,13 @@ def _run_enhance_job(job_id: str, filename: str, labels: list,
                 f = blender.update(f)
 
             # 3. Grid
-            if quality == "maximum" or level in ("very_low", "night"):
+            q_grid = {"fast": (2,2), "balanced": (3,3), "maximum": (4,4)}
+            q_ovl  = {"fast": 0.10,  "balanced": 0.20,  "maximum": 0.30}
+            if level in ("very_low", "night"):
                 n_cols, n_rows = 4, 4
             else:
-                n_cols, n_rows = 3, 3
+                n_cols, n_rows = q_grid.get(quality, (3, 3))
+            _job_overlap = q_ovl.get(quality, 0.20)
 
             # 4. Dynamic confidence
             eff_conf = confidence * _CONF_SCALE.get(level, 1.0)
@@ -1255,7 +1272,8 @@ def _run_enhance_job(job_id: str, filename: str, labels: list,
                 sx = sy = 1.0
 
             # 6. SAHI
-            sahi_dets = _run_sahi(f_sr, predictor, labels, n_cols, n_rows)
+            sahi_dets = _run_sahi(f_sr, predictor, labels, n_cols, n_rows,
+                                  overlap=_job_overlap)
             if sx != 1.0 or sy != 1.0:
                 sahi_dets = _scale_dets(sahi_dets, sx, sy)
 
