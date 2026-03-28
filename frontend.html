@@ -330,6 +330,21 @@ input[type="range"] { width: 100%; height: 4px; accent-color: var(--green); curs
 .toggle-row input[type="checkbox"] { accent-color: var(--green); width: 15px; height: 15px; cursor: pointer; }
 .toggle-label { font-size: .8rem; color: var(--text2); }
 
+/* Quality preset radio buttons */
+.quality-opt { flex: 1; cursor: pointer; }
+.quality-opt input[type="radio"] { display: none; }
+.quality-btn {
+  display: flex; flex-direction: column; align-items: center; gap: 3px;
+  padding: 8px 6px; border: 1px solid var(--border2); border-radius: var(--radius-sm);
+  background: var(--bg3); transition: all .18s; text-align: center;
+}
+.quality-opt input:checked + .quality-btn {
+  border-color: var(--green); background: var(--green-dim); color: var(--green);
+}
+.quality-btn .qb-title { font-size: .78rem; font-weight: 600; }
+.quality-btn .qb-sub   { font-size: .65rem; color: var(--text3); }
+.quality-opt input:checked + .quality-btn .qb-sub { color: rgba(0,217,126,.6); }
+
 .drawer-footer { padding: 16px 20px; border-top: 1px solid var(--border); flex-shrink: 0; display: flex; flex-direction: column; gap: 10px; }
 
 .btn-primary {
@@ -528,6 +543,33 @@ input[type="range"] { width: 100%; height: 4px; accent-color: var(--green); curs
     </div>
 
     <div class="field">
+      <label style="display:block;margin-bottom:8px;color:var(--text2);font-size:.75rem;letter-spacing:.5px">Quality Preset</label>
+      <div style="display:flex;gap:8px">
+        <label class="quality-opt">
+          <input type="radio" name="f-quality" value="fast"/>
+          <span class="quality-btn">
+            <span class="qb-title">Fast</span>
+            <span class="qb-sub">No SR · lower GPU</span>
+          </span>
+        </label>
+        <label class="quality-opt">
+          <input type="radio" name="f-quality" value="balanced" checked/>
+          <span class="quality-btn">
+            <span class="qb-title">Balanced</span>
+            <span class="qb-sub">SR + adaptive TTA</span>
+          </span>
+        </label>
+        <label class="quality-opt">
+          <input type="radio" name="f-quality" value="maximum"/>
+          <span class="quality-btn">
+            <span class="qb-title">Maximum</span>
+            <span class="qb-sub">Full SR + TTA always</span>
+          </span>
+        </label>
+      </div>
+    </div>
+
+    <div class="field">
       <label class="toggle-row">
         <input type="checkbox" id="f-save"/>
         <span class="toggle-label">Start recording immediately</span>
@@ -608,9 +650,10 @@ function closeDrawer() {
 //  Add / Stop stream
 // ══════════════════════════════════════════════════════════
 async function addStream() {
-  const sid    = document.getElementById('f-sid').value.trim() || null;
-  const rtsp   = document.getElementById('f-rtsp').value.trim();
-  const conf   = parseFloat(document.getElementById('f-conf').value);
+  const sid     = document.getElementById('f-sid').value.trim() || null;
+  const rtsp    = document.getElementById('f-rtsp').value.trim();
+  const conf    = parseFloat(document.getElementById('f-conf').value);
+  const quality = document.querySelector('input[name="f-quality"]:checked')?.value || 'balanced';
   const everyN = parseInt(document.getElementById('f-every-n').value);
   const save   = document.getElementById('f-save').checked;
 
@@ -626,7 +669,7 @@ async function addStream() {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({ rtsp_url: rtsp, labels: drawerTags,
                              confidence: conf, every_n: everyN,
-                             save, session_id: sid })
+                             quality, save, session_id: sid })
     });
     const data = await res.json();
     if (!res.ok) { showDrawerError(data.detail || 'Failed to start.'); btn.disabled = false; btn.textContent = '▶  Start Stream'; return; }
@@ -647,6 +690,8 @@ async function addStream() {
     document.getElementById('f-every-n').value = '5';
     document.getElementById('f-every-val').textContent = '5';
     document.getElementById('f-save').checked = false;
+    const balancedRadio = document.querySelector('input[name="f-quality"][value="balanced"]');
+    if (balancedRadio) balancedRadio.checked = true;
 
     if (!pollTimer) pollTimer = setInterval(pollAll, 1500);
   } catch(e) {

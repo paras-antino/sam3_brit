@@ -62,11 +62,25 @@ class StartRequest(BaseModel):
     confidence:  float          = 0.30
     every_n:     int            = 5
     save:        bool           = False
-    session_id:  Optional[str]  = None   # caller may supply a human-readable ID
+    session_id:  Optional[str]  = None
+    quality:     str            = "balanced"   # "fast" | "balanced" | "maximum"
 
 
 class SaveRequest(BaseModel):
     save: bool
+
+
+class EnhanceRequest(BaseModel):
+    filename:   str
+    labels:     List[str]
+    confidence: float = 0.25
+    quality:    str   = "maximum"   # "mild" | "strong" | "maximum"
+
+
+# ── Enhance-job state ─────────────────────────────────────────────────────────
+enhance_jobs: dict      = {}   # job_id → job dict
+enhance_jobs_lock       = threading.Lock()
+_enhance_sem            = threading.Semaphore(1)   # one job at a time (VRAM)
 
 
 # ── Session factory ───────────────────────────────────────────────────────────
@@ -658,8 +672,59 @@ def _merge(*dets_list) -> sv.Detections:
     return merged.with_nms(threshold=0.45)
 
 
+def _filter_false_positives(dets: sv.Detections, frame: np.ndarray,
+                             labels: list) -> sv.Detections:
+    """
+    Remove detections that are almost certainly background/black-space false positives.
+
+    Rules applied per detection box:
+      1. Too large  — box covers >40% of frame area → likely background blob.
+      2. Too small  — box is <0.03% of frame area   → noise speck.
+      3. Zero texture — std-dev of grayscale crop <6 → pure flat/black region.
+         (Gloves/caps have edges; an unlit black wall does not.)
+      4. Aspect ratio guard — width or height >8× the other → degenerate sliver.
+    """
+    if len(dets) == 0:
+        return dets
+
+    fh, fw = frame.shape[:2]
+    frame_area = fh * fw
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    keep = []
+    for i, box in enumerate(dets.xyxy):
+        x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
+        bw = max(x2 - x1, 1)
+        bh = max(y2 - y1, 1)
+        box_area = bw * bh
+
+        # Rule 1: too large
+        if box_area / frame_area > 0.40:
+            continue
+
+        # Rule 2: too small
+        if box_area / frame_area < 0.0003:
+            continue
+
+        # Rule 3: aspect ratio
+        if bw / bh > 8 or bh / bw > 8:
+            continue
+
+        # Rule 4: texture check
+        crop = gray[max(y1,0):min(y2,fh), max(x1,0):min(x2,fw)]
+        if crop.size > 0 and float(crop.std()) < 6.0:
+            continue
+
+        keep.append(i)
+
+    if not keep:
+        return sv.Detections.empty()
+    return dets[keep]
+
+
 # ── Detection loop (per-session) ──────────────────────────────────────────────
-def detection_loop(sess: dict, confidence: float, every_n: int):
+def detection_loop(sess: dict, confidence: float, every_n: int,
+                   quality: str = "balanced"):
     sid = sess["id"]
     labels = sess["labels"]
     rtsp_url = sess["rtsp_url"]
@@ -677,15 +742,29 @@ def detection_loop(sess: dict, confidence: float, every_n: int):
     predictor = SAM3SemanticPredictor(overrides=overrides)
     print(f"[sam3][{sid[:8]}] model loaded  (conf={confidence:.2f})")
 
+    # Quality preset flags
+    _q_use_sr    = quality != "fast"          # fast skips ESRGAN entirely
+    _q_force_tta = quality == "maximum"       # maximum: TTA on every frame
+    _q_force_blend = quality == "maximum"     # maximum: temporal blend on every frame
+    print(f"[quality][{sid[:8]}] preset={quality}  SR={_q_use_sr}  force_tta={_q_force_tta}")
+
     # Shared Real-ESRGAN (lazy init, loaded once for all sessions)
     upsampler, sr_outscale = _get_realesrgan()
 
     # ── Tracker + annotators ──────────────────────────────────────────────────
-    tracker   = ByteTrack(track_activation_threshold=0.25, lost_track_buffer=30,
+    # lost_track_buffer=300 → Kalman-predicts position for ~20s before ByteTrack gives up
+    tracker   = ByteTrack(track_activation_threshold=0.20, lost_track_buffer=300,
                           minimum_matching_threshold=0.8, frame_rate=15)
     box_ann   = sv.BoxAnnotator(thickness=2)
     lbl_ann   = sv.LabelAnnotator(text_scale=0.5, text_thickness=1)
     trace_ann = sv.TraceAnnotator(thickness=2, trace_length=40)
+
+    # Ghost-track cache: survives ByteTrack drops, shown with an amber box
+    # {tid: {"xyxy": [...], "class_id": int, "label": str, "conf": float, "ttl": int}}
+    _GHOST_TTL    = 900   # frames to keep ghost alive (~60s at 15fps)
+    ghost_tracks: dict = {}
+    # track_memory: last known state for every active track_id
+    track_memory: dict = {}
 
     # ── Open RTSP ─────────────────────────────────────────────────────────────
     print(f"[rtsp][{sid[:8]}] connecting -> {rtsp_url}")
@@ -758,33 +837,24 @@ def detection_loop(sess: dict, confidence: float, every_n: int):
                 level = _brightness_level(f)
 
                 # ── 2. Temporal blending for noise suppression ─────────────────
-                # More frames blended = more noise reduction but more ghosting.
-                # Only worth it on dark frames; normal frames skip blending.
-                if level in ("very_low", "night"):
+                if _q_force_blend or level in ("very_low", "night"):
                     f_proc = _blender.update(f)
                 else:
                     f_proc = f
 
                 # ── 3. Adaptive SAHI grid ──────────────────────────────────────
-                # 4×4 for dark conditions → 16 tiles instead of 9.
-                # A person at 50 m that is ~20px tall in 1080p becomes ~30px per
-                # tile (4×4) vs ~38px (3×3 with SR) — combined with SR still a
-                # major resolution win for small objects.
-                if level in ("very_low", "night"):
+                if quality == "maximum" or level in ("very_low", "night"):
                     n_cols, n_rows = 4, 4
                 else:
                     n_cols, n_rows = BASE_GRID
 
-                # ── 4. Dynamic confidence for dark frames ──────────────────
-                # Lower the predictor's threshold before running on dark frames
-                # so depressed text-visual similarity scores aren't silently
-                # discarded inside SAM3.  Restored immediately after.
+                # ── 4. Dynamic confidence for dark frames ──────────────────────
                 eff_conf = confidence * _CONF_SCALE[level]
                 if level != "normal":
                     _set_predictor_conf(predictor, eff_conf)
 
                 # ── 5. Super-resolution ────────────────────────────────────────
-                if upsampler is not None:
+                if _q_use_sr and upsampler is not None:
                     f_sr = _apply_sr(f_proc, upsampler, outscale=sr_outscale)
                     sx   = f_proc.shape[1] / f_sr.shape[1]
                     sy   = f_proc.shape[0] / f_sr.shape[0]
@@ -810,7 +880,7 @@ def detection_loop(sess: dict, confidence: float, every_n: int):
                 full_dets = _infer_full_frame(f_proc, predictor, labels, level)
 
                 # ── 8. TTA: horizontal flip (skipped on OOM) ──────────────────
-                if level in ("low", "very_low", "night"):
+                if _q_force_tta or level in ("low", "very_low", "night"):
                     try:
                         if torch.cuda.is_available():
                             torch.cuda.empty_cache()
@@ -838,6 +908,7 @@ def detection_loop(sess: dict, confidence: float, every_n: int):
                     _set_predictor_conf(predictor, confidence)
 
                 dets = _merge(sahi_dets, full_dets, fl_dets)
+                dets = _filter_false_positives(dets, f_proc, labels)
 
                 print(f"[infer][{sid[:8]}] fid={fid} level={level} "
                       f"conf={eff_conf:.2f} grid={n_cols}×{n_rows} "
@@ -925,6 +996,8 @@ def detection_loop(sess: dict, confidence: float, every_n: int):
                 with det_store_lock:
                     det_store.clear()
                 last_sv_dets = sv.Detections.empty()
+                ghost_tracks.clear()
+                track_memory.clear()
                 time.sleep(backoff)
                 with sess["_lock"]:
                     if not sess["running"]:
@@ -978,11 +1051,36 @@ def detection_loop(sess: dict, confidence: float, every_n: int):
             tracker_ids = tracked.tracker_id if tracked.tracker_id is not None else []
             class_ids   = tracked.class_id   if tracked.class_id   is not None else []
             confidences = tracked.confidence  if tracked.confidence  is not None else []
+            xyxys       = tracked.xyxy        if tracked.xyxy        is not None else []
 
-            for tid, cls_id, conf in zip(tracker_ids, class_ids, confidences):
+            active_tids = set()
+            for tid, cls_id, conf, xyxy in zip(tracker_ids, class_ids, confidences, xyxys):
                 name = labels[cls_id] if cls_id < len(labels) else f"cls_{cls_id}"
                 counts[name] += 1
                 label_texts.append(f"#{tid} {name} {conf:.2f}")
+                active_tids.add(tid)
+                # Update track memory
+                track_memory[tid] = {
+                    "xyxy": xyxy.tolist(), "class_id": cls_id,
+                    "label": name, "conf": float(conf),
+                }
+                # If it re-appeared, remove from ghost
+                ghost_tracks.pop(tid, None)
+
+            # Promote newly-lost tracks to ghost cache
+            for tid, mem in list(track_memory.items()):
+                if tid not in active_tids and tid not in ghost_tracks:
+                    ghost_tracks[tid] = {**mem, "ttl": _GHOST_TTL}
+
+            # Tick ghost TTLs and count them in totals
+            for tid in list(ghost_tracks.keys()):
+                g = ghost_tracks[tid]
+                g["ttl"] -= 1
+                if g["ttl"] <= 0:
+                    ghost_tracks.pop(tid)
+                    track_memory.pop(tid, None)
+                else:
+                    counts[g["label"]] += 1   # keep label count alive
 
             # ── Annotate ───────────────────────────────────────────────────────
             annotated = display_frame.copy()
@@ -990,6 +1088,25 @@ def detection_loop(sess: dict, confidence: float, every_n: int):
             annotated = box_ann.annotate(annotated, tracked)
             if label_texts:
                 annotated = lbl_ann.annotate(annotated, tracked, labels=label_texts)
+
+            # Draw ghost tracks — amber dashed-style box
+            for tid, g in ghost_tracks.items():
+                x1, y1, x2, y2 = [int(v) for v in g["xyxy"]]
+                # Fade opacity based on remaining TTL
+                alpha = min(1.0, g["ttl"] / (_GHOST_TTL * 0.3))
+                color = (0, int(165 * alpha), int(255 * alpha))  # amber fades out
+                cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
+                # Dashed effect: draw corner ticks
+                dash = 12
+                for sx, sy, dx, dy in [(x1,y1,1,1),(x2,y1,-1,1),(x1,y2,1,-1),(x2,y2,-1,-1)]:
+                    cv2.line(annotated, (sx, sy), (sx + dx*dash, sy), color, 2)
+                    cv2.line(annotated, (sx, sy), (sx, sy + dy*dash), color, 2)
+                txt = f"#{tid} {g['label']} [LOST]"
+                (tw, th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+                ty = max(y1 - 4, th + 4)
+                cv2.rectangle(annotated, (x1, ty - th - 2), (x1 + tw + 4, ty + 2), color, -1)
+                cv2.putText(annotated, txt, (x1 + 2, ty),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1, cv2.LINE_AA)
 
             # ── Timing ─────────────────────────────────────────────────────────
             now         = time.time()
@@ -1049,7 +1166,218 @@ def detection_loop(sess: dict, confidence: float, every_n: int):
         print(f"[loop][{sid[:8]}] stopped")
 
 
+# ── Enhance job runner ────────────────────────────────────────────────────────
+
+def _run_enhance_job(job_id: str, filename: str, labels: list,
+                     confidence: float, quality: str):
+    """Offline enhancement + detection on a saved recording."""
+    job = enhance_jobs[job_id]
+
+    def _upd(**kw):
+        with enhance_jobs_lock:
+            enhance_jobs[job_id].update(kw)
+
+    in_path = os.path.join(OUTPUT_DIR, os.path.basename(filename))
+    if not os.path.exists(in_path):
+        _upd(status="failed", error="Input file not found")
+        _enhance_sem.release()
+        return
+
+    out_name = f"enhanced_{job_id[:8]}_{os.path.basename(filename)}"
+    out_path = os.path.join(OUTPUT_DIR, out_name)
+
+    try:
+        cap = cv2.VideoCapture(in_path)
+        if not cap.isOpened():
+            _upd(status="failed", error="Cannot open video file")
+            _enhance_sem.release()
+            return
+
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps_in       = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        w            = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h            = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        _upd(status="running", total_frames=total_frames, processed=0)
+
+        # Quality flags
+        use_sr    = quality != "mild"
+        force_tta = quality == "maximum"
+
+        # Load SAM3 for this job
+        predictor = SAM3SemanticPredictor(MODEL_PATH)
+        predictor.set_classes(labels)
+        _set_predictor_conf(predictor, confidence)
+
+        # Shared SR
+        upsampler, sr_outscale = _get_realesrgan()
+
+        # Output writer (start after first SR'd frame so we know final size)
+        writer_obj  = None
+        out_w = out_h = None
+
+        blender = _TemporalBlender()
+        processed = 0
+
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            level = _brightness_level(frame)
+
+            # 1. Enhancement
+            f = _enhance(frame, level)
+
+            # 2. Temporal blend
+            if force_tta or level in ("very_low", "night"):
+                f = blender.update(f)
+
+            # 3. Grid
+            if quality == "maximum" or level in ("very_low", "night"):
+                n_cols, n_rows = 4, 4
+            else:
+                n_cols, n_rows = 3, 3
+
+            # 4. Dynamic confidence
+            eff_conf = confidence * _CONF_SCALE.get(level, 1.0)
+            _set_predictor_conf(predictor, eff_conf)
+
+            # 5. SR
+            if use_sr and upsampler is not None:
+                f_sr = _apply_sr(f, upsampler, outscale=sr_outscale)
+                sx   = f.shape[1] / f_sr.shape[1]
+                sy   = f.shape[0] / f_sr.shape[0]
+            else:
+                f_sr = f
+                sx = sy = 1.0
+
+            # 6. SAHI
+            sahi_dets = _run_sahi(f_sr, predictor, labels, n_cols, n_rows)
+            if sx != 1.0 or sy != 1.0:
+                sahi_dets = _scale_dets(sahi_dets, sx, sy)
+
+            # 7. Full-frame
+            full_dets = _infer_full_frame(f, predictor, labels, level)
+
+            # 8. TTA
+            fl_dets = sv.Detections.empty()
+            if force_tta or level in ("low", "very_low", "night"):
+                try:
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    fw_ = f.shape[1]
+                    f_fl = cv2.flip(f, 1)
+                    fl_dets = _infer_full_frame(f_fl, predictor, labels, level)
+                    if len(fl_dets) > 0:
+                        xyxy_fl = fl_dets.xyxy.copy()
+                        xyxy_fl[:, [0, 2]] = fw_ - xyxy_fl[:, [2, 0]]
+                        fl_dets = sv.Detections(
+                            xyxy=xyxy_fl,
+                            confidence=fl_dets.confidence,
+                            class_id=fl_dets.class_id,
+                        )
+                except (torch.cuda.OutOfMemoryError, Exception):
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    fl_dets = sv.Detections.empty()
+
+            # 9. Merge + NMS
+            _set_predictor_conf(predictor, confidence)
+            dets = sv.Detections.merge([sahi_dets, full_dets, fl_dets])
+            if len(dets) > 0:
+                keep = sv.box_non_max_suppression(dets.xyxy, dets.confidence or np.ones(len(dets)), 0.45)
+                dets = dets[keep]
+
+            # Draw on original-res frame (not SR'd)
+            out_frame = frame.copy()
+            if len(dets) > 0:
+                annotator = sv.BoxAnnotator(thickness=2)
+                labeler   = sv.LabelAnnotator(text_scale=0.5, text_thickness=1)
+                class_names = [labels[i] if i is not None and i < len(labels) else "?"
+                               for i in (dets.class_id if dets.class_id is not None
+                                         else [None]*len(dets))]
+                det_labels  = [f"{n} {c:.2f}" for n, c in
+                               zip(class_names, dets.confidence if dets.confidence is not None
+                                   else [0.0]*len(dets))]
+                out_frame = annotator.annotate(out_frame.copy(), dets)
+                out_frame = labeler.annotate(out_frame, dets, det_labels)
+
+            # Init writer on first frame
+            if writer_obj is None:
+                out_w, out_h = out_frame.shape[1], out_frame.shape[0]
+                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                writer_obj = cv2.VideoWriter(out_path, fourcc, fps_in, (out_w, out_h))
+
+            writer_obj.write(out_frame)
+            processed += 1
+            if processed % 30 == 0:
+                pct = int(processed / max(total_frames, 1) * 100)
+                _upd(processed=processed, progress_pct=pct)
+
+        cap.release()
+        if writer_obj is not None:
+            writer_obj.release()
+
+        _upd(status="done", processed=processed, progress_pct=100,
+             output_filename=out_name)
+
+    except Exception as exc:
+        _upd(status="failed", error=str(exc))
+        print(f"[enhance][{job_id[:8]}] error: {exc}")
+    finally:
+        _enhance_sem.release()
+
+
 # ── API endpoints ─────────────────────────────────────────────────────────────
+
+@app.post("/enhance")
+def start_enhance(req: EnhanceRequest):
+    if not req.labels:
+        raise HTTPException(400, "Provide at least one label.")
+    fpath = os.path.join(OUTPUT_DIR, os.path.basename(req.filename))
+    if not os.path.exists(fpath):
+        raise HTTPException(404, f"Recording '{req.filename}' not found.")
+
+    job_id = str(uuid.uuid4())
+    job = {
+        "job_id":        job_id,
+        "filename":      req.filename,
+        "labels":        req.labels,
+        "confidence":    req.confidence,
+        "quality":       req.quality,
+        "status":        "queued",
+        "processed":     0,
+        "total_frames":  0,
+        "progress_pct":  0,
+        "output_filename": None,
+        "error":         None,
+        "created_at":    datetime.now().isoformat(),
+    }
+    with enhance_jobs_lock:
+        enhance_jobs[job_id] = job
+
+    def _run():
+        _enhance_sem.acquire()
+        _run_enhance_job(job_id, req.filename, req.labels, req.confidence, req.quality)
+
+    threading.Thread(target=_run, daemon=True).start()
+    return {"status": "queued", "job_id": job_id}
+
+
+@app.get("/enhance/jobs")
+def list_enhance_jobs():
+    with enhance_jobs_lock:
+        return JSONResponse(list(enhance_jobs.values()))
+
+
+@app.get("/enhance/{job_id}")
+def get_enhance_job(job_id: str):
+    with enhance_jobs_lock:
+        job = enhance_jobs.get(job_id)
+    if job is None:
+        raise HTTPException(404, "Job not found")
+    return JSONResponse(job)
+
 
 @app.post("/session/start")
 def start_session(req: StartRequest):
@@ -1066,7 +1394,7 @@ def start_session(req: StartRequest):
 
     t = threading.Thread(
         target=detection_loop,
-        args=(sess, req.confidence, req.every_n),
+        args=(sess, req.confidence, req.every_n, req.quality),
         daemon=True,
     )
     sess["_thread"] = t
@@ -1083,9 +1411,12 @@ def stop_session(session_id: str):
             return {"status": "not running"}
         sess["running"] = False
         sess["saving"]  = False
+    thread = sess.get("_thread")
 
     def _cleanup():
-        time.sleep(4)
+        # Wait for detection_loop to exit cleanly before removing session
+        if thread is not None:
+            thread.join(timeout=8)
         with sessions_lock:
             sessions.pop(session_id, None)
 
