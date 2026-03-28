@@ -191,6 +191,10 @@ header {
   color: var(--red); display: none;
 }
 .badge-rec.active { display: inline-flex; animation: blink 1s infinite; }
+.badge-violation {
+  background: rgba(239,68,68,.2); border: 1px solid rgba(239,68,68,.6);
+  color: var(--red); animation: blink 1s infinite;
+}
 
 /* Violation overlay */
 .violation-overlay {
@@ -590,6 +594,16 @@ input[type="range"] { width: 100%; height: 4px; accent-color: var(--green); curs
 
     <div class="field">
       <label class="toggle-row">
+        <input type="checkbox" id="f-compliance"/>
+        <span class="toggle-label">PPE Compliance Mode</span>
+      </label>
+      <p style="font-size:.68rem;color:var(--text3);margin-top:5px;line-height:1.5">
+        Detects <em>person</em> automatically and highlights anyone missing the required items with a red alert box.
+      </p>
+    </div>
+
+    <div class="field">
+      <label class="toggle-row">
         <input type="checkbox" id="f-save"/>
         <span class="toggle-label">Start recording immediately</span>
       </label>
@@ -672,7 +686,8 @@ async function addStream() {
   const sid     = document.getElementById('f-sid').value.trim() || null;
   const rtsp    = document.getElementById('f-rtsp').value.trim();
   const conf    = parseFloat(document.getElementById('f-conf').value);
-  const quality = document.querySelector('input[name="f-quality"]:checked')?.value || 'balanced';
+  const quality     = document.querySelector('input[name="f-quality"]:checked')?.value || 'balanced';
+  const compliance  = document.getElementById('f-compliance').checked;
   const everyN = parseInt(document.getElementById('f-every-n').value);
   const save   = document.getElementById('f-save').checked;
 
@@ -688,13 +703,13 @@ async function addStream() {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({ rtsp_url: rtsp, labels: drawerTags,
                              confidence: conf, every_n: everyN,
-                             quality, save, session_id: sid })
+                             quality, compliance, save, session_id: sid })
     });
     const data = await res.json();
     if (!res.ok) { showDrawerError(data.detail || 'Failed to start.'); btn.disabled = false; btn.textContent = '▶  Start Stream'; return; }
 
     const finalSid = data.session_id;
-    streams[finalSid] = { labels: [...drawerTags], saving: save, show_lost: false, zoom: 1, panX: 0, panY: 0, dragging: false };
+    streams[finalSid] = { labels: [...drawerTags], saving: save, show_lost: false, compliance, violations: 0, zoom: 1, panX: 0, panY: 0, dragging: false };
 
     createStreamCard(finalSid, rtsp, drawerTags, save);
     updateStreamCountLabel();
@@ -711,6 +726,7 @@ async function addStream() {
     document.getElementById('f-save').checked = false;
     const balancedRadio = document.querySelector('input[name="f-quality"][value="balanced"]');
     if (balancedRadio) balancedRadio.checked = true;
+    document.getElementById('f-compliance').checked = false;
 
     if (!pollTimer) pollTimer = setInterval(pollAll, 1500);
   } catch(e) {
@@ -768,6 +784,7 @@ function createStreamCard(sid, rtspUrl, labels, saving) {
       <div class="overlay-tl">
         <span class="badge badge-live"><span class="bl-dot"></span> LIVE</span>
         <span class="badge badge-rec ${saving ? 'active' : ''}" id="rec-badge-${CSS.escape(sid)}">⏺ REC</span>
+        <span class="badge badge-violation" id="viol-badge-${CSS.escape(sid)}" style="display:none">⚠ <span id="viol-cnt-${CSS.escape(sid)}">0</span> VIOLATION</span>
       </div>
       <div class="violation-overlay" id="viol-${CSS.escape(sid)}">
         <div class="viol-text" id="viol-text-${CSS.escape(sid)}"></div>
@@ -892,6 +909,15 @@ function updateCardStats(d) {
   labels.forEach((lbl, i) => {
     set(`cnt-${CSS.escape(sid)}-${i}`, d.counts[lbl] ?? 0);
   });
+
+  // Violations badge (compliance mode)
+  const violBadge = document.getElementById(`viol-badge-${CSS.escape(sid)}`);
+  const violCnt   = document.getElementById(`viol-cnt-${CSS.escape(sid)}`);
+  if (violBadge && violCnt) {
+    const vCount = d.violations || 0;
+    violBadge.style.display = vCount > 0 ? 'inline-flex' : 'none';
+    violCnt.textContent = vCount;
+  }
 
   // Error
   if (d.error) {
@@ -1070,7 +1096,7 @@ function showDrawerError(msg) {
     if (!sessions.length) return;
     sessions.forEach(d => {
       if (!d.running) return;
-      streams[d.id] = { labels: d.labels || [], saving: d.saving, show_lost: d.show_lost || false, zoom: 1, panX: 0, panY: 0, dragging: false };
+      streams[d.id] = { labels: d.labels || [], saving: d.saving, show_lost: d.show_lost || false, compliance: d.compliance || false, violations: d.violations || 0, zoom: 1, panX: 0, panY: 0, dragging: false };
       createStreamCard(d.id, d.rtsp_url || '', d.labels || [], d.saving);
       if (d.show_lost) updateLostBtn(d.id, true);
     });

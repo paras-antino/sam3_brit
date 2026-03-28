@@ -64,6 +64,7 @@ class StartRequest(BaseModel):
     save:        bool           = False
     session_id:  Optional[str]  = None
     quality:     str            = "balanced"   # "fast" | "balanced" | "maximum"
+    compliance:  bool           = False        # highlight persons missing required items
 
 
 class SaveRequest(BaseModel):
@@ -102,10 +103,12 @@ def _make_session(sid: str, rtsp_url: str, labels: list, saving: bool) -> dict:
         "_writer":     None,
         "_csv_file":   None,
         "_csv_writer": None,
-        "_wlock":      threading.Lock(),
-        "_lock":       threading.Lock(),
-        "_thread":     None,
-        "show_lost":   False,   # ghost tracks hidden by default
+        "_wlock":        threading.Lock(),
+        "_lock":         threading.Lock(),
+        "_thread":       None,
+        "show_lost":     False,   # ghost tracks hidden by default
+        "compliance":    False,   # PPE compliance mode
+        "violations":    0,       # count of non-compliant persons in last frame
     }
 
 
@@ -124,6 +127,8 @@ def _session_public(sess: dict) -> dict:
         "saving":      sess["saving"],
         "save_path":   sess["save_path"],
         "show_lost":   sess.get("show_lost", False),
+        "compliance":  sess.get("compliance", False),
+        "violations":  sess.get("violations", 0),
     }
 
 
@@ -674,6 +679,90 @@ def _merge(*dets_list) -> sv.Detections:
     return merged.with_nms(threshold=0.45)
 
 
+def _compliance_check(dets: sv.Detections, all_labels: list,
+                      required_labels: list) -> list:
+    """
+    Returns a list of violation dicts for persons not wearing every required item.
+    Each violation: {"xyxy": [x1,y1,x2,y2], "missing": ["cap","gloves"]}
+
+    Strategy: a required item is considered "on" a person if its centre point
+    falls within that person's bounding box (with a 15% margin outward).
+    """
+    if len(dets) == 0:
+        return []
+
+    person_idx  = [i for i, l in enumerate(all_labels) if l == "person"]
+    if not person_idx:
+        return []
+    person_cls  = set(person_idx)
+
+    # Indices in all_labels for required items
+    req_cls_map: dict[str, list[int]] = {}
+    for lbl in required_labels:
+        idxs = [i for i, l in enumerate(all_labels) if l == lbl]
+        if idxs:
+            req_cls_map[lbl] = idxs
+
+    if not req_cls_map:
+        return []
+
+    class_ids   = dets.class_id   if dets.class_id   is not None else []
+    xyxys       = dets.xyxy
+
+    # Separate person boxes from target boxes
+    person_boxes = [(i, xyxys[i]) for i, c in enumerate(class_ids) if c in person_cls]
+    target_boxes = [(i, xyxys[i], all_labels[c] if c < len(all_labels) else "?")
+                    for i, c in enumerate(class_ids) if c not in person_cls]
+
+    violations = []
+    for _, pb in person_boxes:
+        px1, py1, px2, py2 = pb
+        pw, ph = px2 - px1, py2 - py1
+        # 15% margin: expand person box outward for association
+        mx1 = px1 - pw * 0.15
+        my1 = py1 - ph * 0.15
+        mx2 = px2 + pw * 0.15
+        my2 = py2 + ph * 0.15
+
+        found_labels = set()
+        for _, tb, tlbl in target_boxes:
+            # Use centre point of target box
+            cx = (tb[0] + tb[2]) / 2
+            cy = (tb[1] + tb[3]) / 2
+            if mx1 <= cx <= mx2 and my1 <= cy <= my2:
+                found_labels.add(tlbl)
+
+        missing = [lbl for lbl in required_labels if lbl not in found_labels]
+        if missing:
+            violations.append({
+                "xyxy":    [int(px1), int(py1), int(px2), int(py2)],
+                "missing": missing,
+            })
+
+    return violations
+
+
+def _draw_compliance(img: np.ndarray, violations: list) -> np.ndarray:
+    """Draw red violation boxes with MISSING label on the frame."""
+    for v in violations:
+        x1, y1, x2, y2 = v["xyxy"]
+        miss_txt = "MISSING: " + ", ".join(v["missing"])
+        # Red filled border
+        cv2.rectangle(img, (x1, y1), (x2, y2), (0, 0, 220), 3)
+        # Corner ticks for emphasis
+        dash = 16
+        for sx, sy, dx, dy in [(x1,y1,1,1),(x2,y1,-1,1),(x1,y2,1,-1),(x2,y2,-1,-1)]:
+            cv2.line(img, (sx, sy), (sx+dx*dash, sy), (0,0,255), 3)
+            cv2.line(img, (sx, sy), (sx, sy+dy*dash), (0,0,255), 3)
+        # Label background
+        (tw, th), _ = cv2.getTextSize(miss_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        ty = max(y1 - 4, th + 6)
+        cv2.rectangle(img, (x1, ty - th - 4), (x1 + tw + 6, ty + 2), (0, 0, 180), -1)
+        cv2.putText(img, miss_txt, (x1 + 3, ty),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+    return img
+
+
 def _filter_false_positives(dets: sv.Detections, frame: np.ndarray,
                              labels: list) -> sv.Detections:
     """
@@ -728,7 +817,13 @@ def _filter_false_positives(dets: sv.Detections, frame: np.ndarray,
 def detection_loop(sess: dict, confidence: float, every_n: int,
                    quality: str = "balanced"):
     sid = sess["id"]
-    labels = sess["labels"]
+    labels    = list(sess["labels"])            # user-specified targets
+    compliance_mode = sess.get("compliance", False)
+    # In compliance mode we always detect "person" so we can cross-reference
+    if compliance_mode and "person" not in labels:
+        labels = labels + ["person"]
+    # required_labels = the original user labels (not "person")
+    required_labels = [l for l in labels if l != "person"]
     rtsp_url = sess["rtsp_url"]
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -758,14 +853,15 @@ def detection_loop(sess: dict, confidence: float, every_n: int,
     _q_base_grid  = _Q_GRID.get(quality, (3, 3))
     _q_overlap    = _Q_OVL.get(quality, 0.20)
     _q_conf_scale = _Q_CSCALE.get(quality, 1.00)
+
+    # Shared Real-ESRGAN (lazy init, loaded once for all sessions)
+    upsampler, sr_outscale = _get_realesrgan()
+
     sr_status = "disabled (not installed)" if upsampler is None else ("enabled" if _q_use_sr else "skipped (fast mode)")
     print(f"[quality][{sid[:8]}] preset={quality}  grid={_q_base_grid}  "
           f"overlap={_q_overlap}  SR={sr_status}  "
           f"TTA={'always' if _q_force_tta else 'dark-only'}  "
           f"conf_scale={_q_conf_scale}")
-
-    # Shared Real-ESRGAN (lazy init, loaded once for all sessions)
-    upsampler, sr_outscale = _get_realesrgan()
 
     # ── Tracker + annotators ──────────────────────────────────────────────────
     # lost_track_buffer=300 → Kalman-predicts position for ~20s before ByteTrack gives up
@@ -864,7 +960,7 @@ def detection_loop(sess: dict, confidence: float, every_n: int,
                 # ── 4. Dynamic confidence ──────────────────────────────────────
                 # Dark scenes lower conf to surface weak detections.
                 # Maximum quality also lowers it to improve recall in good light.
-                eff_conf = confidence * _CONF_SCALE[level] * _q_conf_scale
+                eff_conf = confidence * _CONF_SCALE.get(level, 1.0) * _q_conf_scale
                 if level != "normal":
                     _set_predictor_conf(predictor, eff_conf)
 
@@ -1105,6 +1201,15 @@ def detection_loop(sess: dict, confidence: float, every_n: int,
             if label_texts:
                 annotated = lbl_ann.annotate(annotated, tracked, labels=label_texts)
 
+            # ── Compliance check ───────────────────────────────────────────────
+            _violations = []
+            if compliance_mode and len(tracked) > 0:
+                _violations = _compliance_check(tracked, labels, required_labels)
+                if _violations:
+                    annotated = _draw_compliance(annotated, _violations)
+            with sess["_lock"]:
+                sess["violations"] = len(_violations)
+
             # Draw ghost tracks — amber dashed-style box (only if enabled)
             _show_lost = sess.get("show_lost", False)
             for tid, g in (ghost_tracks.items() if _show_lost else []):
@@ -1197,8 +1302,7 @@ def _run_enhance_job(job_id: str, filename: str, labels: list,
     in_path = os.path.join(OUTPUT_DIR, os.path.basename(filename))
     if not os.path.exists(in_path):
         _upd(status="failed", error="Input file not found")
-        _enhance_sem.release()
-        return
+        return   # finally block releases semaphore
 
     out_name = f"enhanced_{job_id[:8]}_{os.path.basename(filename)}"
     out_path = os.path.join(OUTPUT_DIR, out_name)
@@ -1207,8 +1311,7 @@ def _run_enhance_job(job_id: str, filename: str, labels: list,
         cap = cv2.VideoCapture(in_path)
         if not cap.isOpened():
             _upd(status="failed", error="Cannot open video file")
-            _enhance_sem.release()
-            return
+            return   # finally block releases semaphore
 
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         fps_in       = cap.get(cv2.CAP_PROP_FPS) or 25.0
@@ -1274,8 +1377,12 @@ def _run_enhance_job(job_id: str, filename: str, labels: list,
             # 6. SAHI
             sahi_dets = _run_sahi(f_sr, predictor, labels, n_cols, n_rows,
                                   overlap=_job_overlap)
-            if sx != 1.0 or sy != 1.0:
-                sahi_dets = _scale_dets(sahi_dets, sx, sy)
+            if (sx != 1.0 or sy != 1.0) and len(sahi_dets) > 0:
+                sahi_dets = sv.Detections(
+                    xyxy=_scale_boxes(sahi_dets.xyxy, sx, sy),
+                    confidence=sahi_dets.confidence,
+                    class_id=sahi_dets.class_id,
+                )
 
             # 7. Full-frame
             full_dets = _infer_full_frame(f, predictor, labels, level)
@@ -1411,6 +1518,7 @@ def start_session(req: StartRequest):
         if sid in sessions and sessions[sid]["running"]:
             raise HTTPException(409, f"Session '{sid}' is already running.")
         sess = _make_session(sid, req.rtsp_url, req.labels, req.save)
+        sess["compliance"] = req.compliance
         sessions[sid] = sess
 
     t = threading.Thread(

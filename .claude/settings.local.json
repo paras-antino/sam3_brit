@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c \"import numpy as np; print\\(np.hstack\\([None, np.array\\([1,2]\\)]\\)\\)\")"
+    ]
+  }
+}
