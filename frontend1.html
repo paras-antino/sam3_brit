@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>SAM3 · Backup Monitor</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0d1117;--bg2:#161b22;--border:#21262d;
+  --green:#2ea043;--red:#f85149;--amber:#e3b341;
+  --text:#e6edf3;--text2:#8b949e;
+  --radius:8px;
+}
+body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;min-height:100vh}
+
+/* ── Header ── */
+header{
+  background:var(--bg2);border-bottom:1px solid var(--border);
+  padding:14px 24px;display:flex;align-items:center;gap:14px;
+}
+header h1{font-size:.95rem;font-weight:600;letter-spacing:1px}
+header .sub{font-size:.7rem;color:var(--text2);margin-left:auto}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--green);
+     animation:pulse 1.4s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+
+/* ── Layout ── */
+.wrap{display:flex;gap:0;height:calc(100vh - 53px)}
+
+/* ── Sidebar ── */
+.sidebar{
+  width:300px;flex-shrink:0;background:var(--bg2);
+  border-right:1px solid var(--border);
+  display:flex;flex-direction:column;overflow-y:auto;
+}
+.sidebar-inner{padding:20px;display:flex;flex-direction:column;gap:14px}
+
+.field label{display:block;font-size:.72rem;color:var(--text2);
+             margin-bottom:5px;letter-spacing:.4px}
+.field input[type=text],.field input[type=number],.field input[type=range]{
+  width:100%;background:#010409;border:1px solid var(--border);
+  border-radius:var(--radius);color:var(--text);
+  padding:7px 10px;font-size:.8rem;outline:none;
+  transition:border-color .15s;
+}
+.field input:focus{border-color:var(--green)}
+input[type=range]{padding:4px 0;accent-color:var(--green);cursor:pointer}
+.slider-row{display:flex;justify-content:space-between;align-items:center;margin-bottom:4px}
+.sv{color:var(--green);font-weight:600;font-size:.78rem}
+
+/* Tags */
+.tags-wrap{
+  display:flex;flex-wrap:wrap;gap:5px;
+  background:#010409;border:1px solid var(--border);
+  border-radius:var(--radius);padding:6px 8px;min-height:36px;
+  cursor:text;
+}
+.tags-wrap:focus-within{border-color:var(--green)}
+.tag{
+  display:inline-flex;align-items:center;gap:4px;
+  background:rgba(46,160,67,.18);border:1px solid rgba(46,160,67,.35);
+  color:var(--green);border-radius:4px;padding:2px 7px;font-size:.72rem;
+}
+.tag button{background:none;border:none;color:inherit;cursor:pointer;
+            font-size:.8rem;line-height:1;padding:0}
+.tags-wrap input{flex:1;min-width:80px;background:none;border:none;
+                 outline:none;color:var(--text);font-size:.78rem}
+
+/* Buttons */
+.btn{
+  width:100%;padding:9px;border:none;border-radius:var(--radius);
+  font-size:.8rem;font-weight:600;cursor:pointer;letter-spacing:.4px;
+  transition:opacity .15s;
+}
+.btn:active{opacity:.8}
+.btn-start{background:var(--green);color:#fff}
+.btn-start:disabled{background:#2d4a35;color:#5a8a62;cursor:not-allowed}
+.btn-stop{background:rgba(248,81,73,.15);border:1px solid rgba(248,81,73,.4);
+          color:var(--red)}
+.btn-stop:hover{background:rgba(248,81,73,.25)}
+
+.err{font-size:.72rem;color:var(--red);min-height:16px}
+
+/* ── Stats panel ── */
+.stats-panel{
+  background:#010409;border:1px solid var(--border);
+  border-radius:var(--radius);padding:12px;
+  display:flex;flex-direction:column;gap:6px;
+}
+.stat-row{display:flex;justify-content:space-between;font-size:.75rem}
+.stat-row .lbl{color:var(--text2)}
+.counts{display:flex;flex-direction:column;gap:4px;margin-top:4px}
+.count-item{
+  display:flex;justify-content:space-between;align-items:center;
+  background:rgba(46,160,67,.08);border:1px solid rgba(46,160,67,.2);
+  border-radius:4px;padding:3px 8px;font-size:.75rem;
+}
+.count-item .cn{color:var(--text2)}
+.count-item .cv{color:var(--green);font-weight:700}
+
+/* ── Video area ── */
+.video-area{
+  flex:1;display:flex;align-items:center;justify-content:center;
+  background:#000;position:relative;overflow:hidden;
+}
+#feed{max-width:100%;max-height:100%;object-fit:contain;display:none}
+#feed.active{display:block}
+.placeholder{
+  display:flex;flex-direction:column;align-items:center;gap:10px;
+  color:var(--text2);font-size:.8rem;
+}
+.placeholder svg{width:48px;height:48px;opacity:.25}
+
+.badge{
+  position:absolute;top:12px;left:12px;
+  display:inline-flex;align-items:center;gap:6px;
+  background:rgba(46,160,67,.2);border:1px solid rgba(46,160,67,.4);
+  color:var(--green);border-radius:4px;padding:3px 10px;
+  font-size:.68rem;font-weight:700;letter-spacing:.5px;
+  display:none;
+}
+.badge.active{display:inline-flex}
+.badge .d{width:6px;height:6px;border-radius:50%;
+          background:var(--green);animation:pulse 1.2s infinite}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="dot"></div>
+  <h1>SAM3 · BACKUP MONITOR</h1>
+  <span class="sub">Simple • Reliable • No frills</span>
+</header>
+
+<div class="wrap">
+
+  <!-- Sidebar -->
+  <div class="sidebar">
+    <div class="sidebar-inner">
+
+      <div class="field">
+        <label>RTSP URL</label>
+        <input type="text" id="rtsp" placeholder="rtsp://192.168.1.10:554/stream"/>
+      </div>
+
+      <div class="field">
+        <label>DETECTION TARGETS — press Enter to add</label>
+        <div class="tags-wrap" id="tags-wrap" onclick="document.getElementById('tag-input').focus()">
+          <input id="tag-input" placeholder="e.g. surgical cap"/>
+        </div>
+      </div>
+
+      <div class="field">
+        <div class="slider-row">
+          <label style="margin:0">Confidence</label>
+          <span class="sv" id="conf-val">0.30</span>
+        </div>
+        <input type="range" id="conf" min="0.10" max="0.90" step="0.05" value="0.30"
+               oninput="document.getElementById('conf-val').textContent=parseFloat(this.value).toFixed(2)"/>
+      </div>
+
+      <div class="field">
+        <div class="slider-row">
+          <label style="margin:0">Infer Every N Frames</label>
+          <span class="sv" id="every-val">3</span>
+        </div>
+        <input type="range" id="every-n" min="1" max="10" step="1" value="3"
+               oninput="document.getElementById('every-val').textContent=this.value"/>
+      </div>
+
+      <p class="err" id="err"></p>
+
+      <button class="btn btn-start" id="start-btn" onclick="startStream()">▶  Start</button>
+      <button class="btn btn-stop"  id="stop-btn"  onclick="stopStream()" style="display:none">■  Stop</button>
+
+      <!-- Stats -->
+      <div class="stats-panel" id="stats" style="display:none">
+        <div class="stat-row"><span class="lbl">FPS</span><span class="sv" id="st-fps">—</span></div>
+        <div class="stat-row"><span class="lbl">Session</span><span class="sv" id="st-sid" style="font-size:.65rem;word-break:break-all">—</span></div>
+        <div class="stat-row"><span class="lbl">Status</span><span class="sv" id="st-status">—</span></div>
+        <div class="counts" id="counts"></div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- Video -->
+  <div class="video-area">
+    <div class="placeholder" id="placeholder">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1">
+        <rect x="2" y="7" width="15" height="10" rx="2"/>
+        <path d="M17 9l5-3v12l-5-3"/>
+      </svg>
+      <span>No active stream</span>
+    </div>
+    <img id="feed" alt="stream"/>
+    <div class="badge" id="live-badge"><div class="d"></div> LIVE</div>
+  </div>
+
+</div>
+
+<script>
+// ── Tag input ─────────────────────────────────────────────────────────────────
+let tags = [];
+
+document.getElementById('tag-input').addEventListener('keydown', e => {
+  const v = e.target.value.trim().toLowerCase();
+  if ((e.key === 'Enter' || e.key === ',') && v) {
+    e.preventDefault();
+    if (!tags.includes(v)) { tags.push(v); renderTags(); }
+    e.target.value = '';
+  }
+  if (e.key === 'Backspace' && !e.target.value && tags.length) {
+    tags.pop(); renderTags();
+  }
+});
+
+function renderTags() {
+  document.querySelectorAll('#tags-wrap .tag').forEach(el => el.remove());
+  const wrap = document.getElementById('tags-wrap');
+  const inp  = document.getElementById('tag-input');
+  tags.forEach(t => {
+    const el = document.createElement('div');
+    el.className = 'tag';
+    el.innerHTML = `${t}<button onclick="removeTag('${t}')">×</button>`;
+    wrap.insertBefore(el, inp);
+  });
+}
+function removeTag(t) { tags = tags.filter(x => x !== t); renderTags(); }
+
+// ── Session state ─────────────────────────────────────────────────────────────
+let currentSid  = null;
+let pollTimer   = null;
+
+function showErr(msg) { document.getElementById('err').textContent = msg; }
+
+// ── Start / Stop ──────────────────────────────────────────────────────────────
+async function startStream() {
+  const rtsp   = document.getElementById('rtsp').value.trim();
+  const conf   = parseFloat(document.getElementById('conf').value);
+  const everyN = parseInt(document.getElementById('every-n').value);
+
+  if (!rtsp)        { showErr('Enter RTSP URL.'); return; }
+  if (!tags.length) { showErr('Add at least one label.'); return; }
+  showErr('');
+
+  const btn = document.getElementById('start-btn');
+  btn.disabled = true;
+  btn.textContent = 'Connecting…';
+
+  try {
+    const res  = await fetch('/session/start', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ rtsp_url: rtsp, labels: tags,
+                             confidence: conf, every_n: everyN })
+    });
+    const data = await res.json();
+    if (!res.ok) { showErr(data.detail || 'Failed to start.'); btn.disabled=false; btn.textContent='▶  Start'; return; }
+
+    currentSid = data.session_id;
+    document.getElementById('st-sid').textContent = currentSid;
+
+    // Start feed after short delay
+    setTimeout(() => {
+      const feed = document.getElementById('feed');
+      feed.onload = () => {
+        feed.classList.add('active');
+        document.getElementById('placeholder').style.display = 'none';
+        document.getElementById('live-badge').classList.add('active');
+      };
+      feed.src = `/stream/${encodeURIComponent(currentSid)}?t=${Date.now()}`;
+    }, 1000);
+
+    document.getElementById('start-btn').style.display = 'none';
+    document.getElementById('stop-btn').style.display  = 'block';
+    document.getElementById('stats').style.display     = 'block';
+
+    pollTimer = setInterval(poll, 1500);
+
+  } catch(e) {
+    showErr('Connection error.'); btn.disabled=false; btn.textContent='▶  Start';
+  }
+}
+
+async function stopStream() {
+  if (!currentSid) return;
+  try { await fetch(`/session/${encodeURIComponent(currentSid)}/stop`, {method:'POST'}); }
+  catch(e) {}
+  resetUI();
+}
+
+function resetUI() {
+  clearInterval(pollTimer); pollTimer = null;
+  const feed = document.getElementById('feed');
+  feed.src = ''; feed.classList.remove('active');
+  document.getElementById('placeholder').style.display = 'flex';
+  document.getElementById('live-badge').classList.remove('active');
+  document.getElementById('start-btn').style.display = 'block';
+  document.getElementById('start-btn').disabled = false;
+  document.getElementById('start-btn').textContent = '▶  Start';
+  document.getElementById('stop-btn').style.display = 'none';
+  document.getElementById('stats').style.display    = 'none';
+  document.getElementById('counts').innerHTML = '';
+  currentSid = null;
+}
+
+// ── Poll status ───────────────────────────────────────────────────────────────
+async function poll() {
+  if (!currentSid) return;
+  try {
+    const res  = await fetch(`/session/${encodeURIComponent(currentSid)}/status`);
+    if (!res.ok) { resetUI(); return; }
+    const data = await res.json();
+
+    document.getElementById('st-fps').textContent    = data.fps.toFixed(1);
+    document.getElementById('st-status').textContent = data.running ? 'Running' : 'Stopped';
+
+    if (data.error) {
+      document.getElementById('st-status').textContent = '⚠ ' + data.error;
+      document.getElementById('st-status').style.color = 'var(--red)';
+    }
+
+    // Label counts
+    const wrap = document.getElementById('counts');
+    wrap.innerHTML = '';
+    Object.entries(data.counts || {}).forEach(([lbl, cnt]) => {
+      const el = document.createElement('div');
+      el.className = 'count-item';
+      el.innerHTML = `<span class="cn">${lbl}</span><span class="cv">${cnt}</span>`;
+      wrap.appendChild(el);
+    });
+
+    if (!data.running) resetUI();
+
+  } catch(e) {}
+}
+
+// ── Restore on reload ─────────────────────────────────────────────────────────
+(async () => {
+  try {
+    const sessions = await (await fetch('/sessions')).json();
+    const active   = sessions.find(s => s.running);
+    if (!active) return;
+    currentSid = active.id;
+    tags = active.labels || [];
+    renderTags();
+    document.getElementById('rtsp').value = active.rtsp_url || '';
+    document.getElementById('st-sid').textContent = currentSid;
+
+    setTimeout(() => {
+      const feed = document.getElementById('feed');
+      feed.onload = () => {
+        feed.classList.add('active');
+        document.getElementById('placeholder').style.display = 'none';
+        document.getElementById('live-badge').classList.add('active');
+      };
+      feed.src = `/stream/${encodeURIComponent(currentSid)}?t=${Date.now()}`;
+    }, 500);
+
+    document.getElementById('start-btn').style.display = 'none';
+    document.getElementById('stop-btn').style.display  = 'block';
+    document.getElementById('stats').style.display     = 'block';
+    pollTimer = setInterval(poll, 1500);
+  } catch(e) {}
+})();
+</script>
+</body>
+</html>

@@ -170,21 +170,25 @@ def open_writers(sess: dict, ts: str, labels_list: list,
     ]
 
     with sess["_wlock"]:
-        new_proc = subprocess.Popen(
-            ffmpeg_cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-        )
-        print(f"[ffmpeg][{sess['id'][:8]}] started PID={new_proc.pid}  scratch={scratch}")
-
-        new_csv = open(cpath, "w", newline="")
-        new_cw  = csv.writer(new_csv)
-        new_cw.writerow(["frame", "timestamp"] + labels_list + ["total_tracks", "fps"])
-
-        sess["_writer"]     = new_proc
-        sess["_csv_file"]   = new_csv
-        sess["_csv_writer"] = new_cw
+        new_csv = None
+        try:
+            new_proc = subprocess.Popen(
+                ffmpeg_cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+            print(f"[ffmpeg][{sess['id'][:8]}] started PID={new_proc.pid}  scratch={scratch}")
+            new_csv = open(cpath, "w", newline="")
+            new_cw  = csv.writer(new_csv)
+            new_cw.writerow(["frame", "timestamp"] + labels_list + ["total_tracks", "fps"])
+            sess["_writer"]     = new_proc
+            sess["_csv_file"]   = new_csv
+            sess["_csv_writer"] = new_cw
+        except Exception:
+            if new_csv is not None:
+                new_csv.close()
+            raise
 
     with sess["_lock"]:
         sess["save_path"] = scratch
@@ -230,6 +234,7 @@ def close_writers(sess: dict):
 
         if sess["_csv_file"] is not None:
             try:
+                sess["_csv_file"].flush()
                 sess["_csv_file"].close()
             except Exception as exc:
                 print(f"[csv][{sid_prefix}] close error: {exc}")
@@ -459,7 +464,10 @@ class _TemporalBlender:
         self._decay = decay
 
     def update(self, frame: np.ndarray) -> np.ndarray:
-        self._buf.append(frame.astype(np.float32))
+        frame = frame.astype(np.float32)
+        if self._buf and self._buf[0].shape != frame.shape:
+            self._buf.clear()   # resolution changed — reset rather than crash
+        self._buf.append(frame)
         n       = len(self._buf)
         weights = [self._decay ** (n - 1 - i) for i in range(n)]
         total_w = sum(weights)
@@ -1291,8 +1299,8 @@ def detection_loop(sess: dict, confidence: float, every_n: int,
                 try:
                     current_writer.stdin.write(annotated.tobytes())
                     current_writer.stdin.flush()
-                except BrokenPipeError:
-                    print(f"[ffmpeg][{sid[:8]}] broken pipe — stopping save")
+                except (BrokenPipeError, OSError, ValueError) as exc:
+                    print(f"[ffmpeg][{sid[:8]}] write error ({type(exc).__name__}) — stopping save")
                     close_writers(sess)
                     with sess["_lock"]:
                         sess["saving"] = False
